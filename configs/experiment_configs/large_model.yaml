@@ -1,0 +1,93 @@
+model:
+  dim: 768
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.1
+  max_seq_length: 4096
+  vocab_size: 50000
+  
+  # Adaptive attention parameters
+  local_window_size: 64
+  global_ratio: 0.1
+  learnable_sparsity: true
+  temperature: 1.0
+  sparsity_ratio: 0.2  # More aggressive sparsity for large model
+  model_type: "adaptive_transformer"
+
+training:
+  batch_size: 8
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  num_epochs: 100
+  warmup_steps: 2000
+  gradient_clip_norm: 1.0
+  
+  # Learning rate scheduling
+  lr_scheduler: "cosine"
+  lr_decay_rate: 0.95
+  
+  # Optimization
+  optimizer: "adamw"
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-08
+  
+  # Training settings
+  accumulate_grad_batches: 4  # Effective batch size = 8 * 4 = 32
+  mixed_precision: true
+  compile_model: true  # Use PyTorch 2.0 compilation
+  
+  # Evaluation
+  eval_every_n_steps: 1000
+  eval_batch_size: 4  # Smaller for memory efficiency
+  
+  # Early stopping
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0001
+
+data:
+  dataset_name: "custom"
+  data_dir: "./data"
+  tokenizer_name: null
+  max_length: 1024
+  min_length: 10
+  stride: 512
+  
+  # Data loading
+  num_workers: 4
+  pin_memory: true
+  shuffle_train: true
+  
+  # Data augmentation
+  random_masking: true
+  masking_prob: 0.15
+
+experiment:
+  experiment_name: "large_adaptive_transformer"
+  project_name: "adaptive_transformers"
+  description: "Large model for production training with comprehensive logging"
+  tags: ["large", "production", "adaptive_attention", "mixed_precision"]
+  
+  # Paths
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  
+  # Logging
+  log_level: "INFO"
+  log_every_n_steps: 100
+  save_every_n_steps: 2000
+  
+  # Wandb configuration
+  use_wandb: true
+  wandb_project: "adaptive_transformers"
+  wandb_entity: null  # Set this to your wandb username/team
+  wandb_run_name: null  # Will auto-generate
+  
+  # Reproducibility
+  seed: 42
+  deterministic: true
+  
+  # Hardware
+  device: "auto"
+  num_gpus: 1

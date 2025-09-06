@@ -1,0 +1,64 @@
+# Debug configuration - simplified version of base config
+model:
+  vocab_size: 30522 # Keep same as base
+  dim: 128          # Reduced from 256
+  depth: 2          # Reduced from 6
+  num_heads: 4      # Reduced from 12
+  mlp_ratio: 4.0    # Keep same
+  max_seq_len: 256  # Reduced from 512
+  dropout: 0.0      # No dropout for debugging
+  num_classes: 2    # Keep same
+
+# Adaptive attention specific parameters
+attention:
+  local_window_size: 16  # Reduced from 64
+  global_ratio: 0.1      # Keep same
+  learnable_sparsity: true
+  temperature: 1.0
+
+# Training configuration
+training:
+  batch_size: 2          # Reduced from 4
+  learning_rate: 0.0001  # Reduced from 0.001 for stability
+  num_epochs: 2          # Reduced from 1
+  warmup_steps: 10       # Reduced from 1000
+  weight_decay: 0.0      # No weight decay for debugging
+  gradient_clip_norm: 1.0
+  save_steps: 10         # More frequent saves
+  eval_steps: 5          # More frequent evaluation
+  logging_steps: 1       # Log every step
+  seed: 42
+
+# Data configuration
+data:
+  dataset_name: "imdb"
+  max_length: 64         # Much smaller sequences
+  train_split: "train"
+  eval_split: "test" 
+  num_workers: 0         # Single threaded for debugging
+
+# Experiment tracking
+wandb:
+  project: null          # Disable wandb for debugging
+  entity: null
+  tags: ["debug", "transformer"]
+
+# Evaluation Configuration
+evaluation:
+  eval_steps: 5
+  eval_batch_size: 2     # Match training batch size
+  save_best_model: true
+  early_stopping_patience: 100  # Effectively disable
+  metrics_to_track: ["loss", "accuracy"]
+  save_steps: 10
+  logging_steps: 1
+  max_eval_samples: 20   # Limit eval samples
+  metric_for_best_model: "loss"
+  greater_is_better: false
+
+# Hardware Configuration
+hardware:
+  mixed_precision: false  # Critical - keep disabled
+  device: "cpu"          # Force CPU
+  num_workers: 0         # Single threaded
+  pin_memory: false      # Disable for CPU

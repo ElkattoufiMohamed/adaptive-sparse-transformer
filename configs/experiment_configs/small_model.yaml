@@ -1,0 +1,93 @@
+model:
+  dim: 256
+  num_layers: 4
+  num_heads: 4
+  dropout: 0.1
+  max_seq_length: 1024
+  vocab_size: 50000
+  
+  # Adaptive attention parameters
+  local_window_size: 16
+  global_ratio: 0.1
+  learnable_sparsity: true
+  temperature: 1.0
+  sparsity_ratio: 0.3
+  model_type: "adaptive_transformer"
+
+training:
+  batch_size: 16
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  num_epochs: 50
+  warmup_steps: 500
+  gradient_clip_norm: 1.0
+  
+  # Learning rate scheduling
+  lr_scheduler: "cosine"
+  lr_decay_rate: 0.95
+  
+  # Optimization
+  optimizer: "adamw"
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-08
+  
+  # Training settings
+  accumulate_grad_batches: 1
+  mixed_precision: false
+  compile_model: false
+  
+  # Evaluation
+  eval_every_n_steps: 200
+  eval_batch_size: 16
+  
+  # Early stopping
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.0001
+
+data:
+  dataset_name: "custom"
+  data_dir: "./data"
+  tokenizer_name: null
+  max_length: 256
+  min_length: 10
+  stride: 128
+  
+  # Data loading
+  num_workers: 2
+  pin_memory: true
+  shuffle_train: true
+  
+  # Data augmentation
+  random_masking: false
+  masking_prob: 0.15
+
+experiment:
+  experiment_name: "small_adaptive_transformer"
+  project_name: "adaptive_transformers"
+  description: "Small model for quick experimentation and development"
+  tags: ["small", "development", "adaptive_attention"]
+  
+  # Paths
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  
+  # Logging
+  log_level: "INFO"
+  log_every_n_steps: 50
+  save_every_n_steps: 500
+  
+  # Wandb configuration
+  use_wandb: false
+  wandb_project: null
+  wandb_entity: null
+  wandb_run_name: null
+  
+  # Reproducibility
+  seed: 42
+  deterministic: true
+  
+  # Hardware
+  device: "auto"
+  num_gpus: 1
