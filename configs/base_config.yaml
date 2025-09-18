@@ -1,12 +1,12 @@
 # Base configuration for all experiments
 model:
   vocab_size: 30522 # BERT tokenizer vocab size
-  dim: 256
+  dim: 768
   depth: 6
   num_heads: 12
   mlp_ratio: 4.0
   max_seq_len: 512
-  dropout: 0.0
+  dropout: 0.1
   num_classes: 2
 
 # Adaptive attention specific parameters
@@ -19,11 +19,12 @@ attention:
 # Training configuration
 training:
   batch_size: 4
-  learning_rate: 0.001
+  learning_rate: 0.0001
   num_epochs: 1
-  warmup_steps: 1000
+  warmup_steps: 0
+  lr_scheduler: "constant"
   weight_decay: 0.01
-  gradient_clip_norm: 1.0
+  gradient_clip_norm: false #1.0
   save_steps: 1000
   eval_steps: 500
   logging_steps: 100
@@ -39,14 +40,14 @@ data:
 
 # Experiment tracking
 wandb:
-  project: "adaptive-sparse-transformer"
+  project: null #adaptive-sparse-transformer"
   entity: "mohamedelkattoufi-fsm"
   tags: ["transformer", "attention", "sparse"]
 
 # Evaluation Configuration
 evaluation:
   eval_steps: 500
-  eval_batch_size: 32
+  eval_batch_size: 4
   save_best_model: true
   early_stopping_patience: 10
   metrics_to_track: ["loss", "accuracy"]
@@ -59,6 +60,9 @@ evaluation:
 # Hardware Configuration
 hardware:
   mixed_precision: false
-  device: "auto"  # or "cuda", "cpu"
+  device: "auto" # or "cuda", "cpu"
   num_workers: 4
-  pin_memory: true
+  pin_memory: false
+
+scheduler:
+  type: "none"
