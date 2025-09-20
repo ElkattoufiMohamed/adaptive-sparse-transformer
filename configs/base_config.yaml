@@ -20,7 +20,7 @@ attention:
 training:
   batch_size: 4
   learning_rate: 0.0001
-  num_epochs: 1
+  num_epochs: 5
   warmup_steps: 0
   lr_scheduler: "constant"
   weight_decay: 0.01
@@ -40,7 +40,7 @@ data:
 
 # Experiment tracking
 wandb:
-  project: null #adaptive-sparse-transformer"
+  project: "adaptive-sparse-transformer"
   entity: "mohamedelkattoufi-fsm"
   tags: ["transformer", "attention", "sparse"]
 
