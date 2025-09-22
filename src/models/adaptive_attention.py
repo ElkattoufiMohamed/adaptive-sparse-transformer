@@ -157,6 +157,29 @@ class AdaptiveSparseAttention(nn.Module):
         pooled_features = torch.mean(x, dim=1)
         pattern_weights = self.pattern_selector(pooled_features)  # (B, 3)
 
+        pooled_features = torch.mean(x, dim=1)
+        pattern_weights = self.pattern_selector(pooled_features)
+        
+        # ADD DEBUGGING HERE:
+        if self.training:  # Only debug during training
+            print(f"DEBUG Pooled features stats: mean={pooled_features.mean().item():.6f}, std={pooled_features.std().item():.6f}")
+            print(f"DEBUG Pattern weights sample: {pattern_weights[0].detach().cpu().numpy()}")
+            print(f"DEBUG Pattern weights std: {pattern_weights.std().item():.6f}")
+            
+            # Check pattern selector network outputs before softmax
+            with torch.no_grad():
+                pre_softmax = self.pattern_selector[:-1](pooled_features)  # Without softmax
+                print(f"DEBUG Pre-softmax logits: {pre_softmax[0].detach().cpu().numpy()}")
+            
+            # Register gradient hook
+            def grad_hook(grad):
+                if grad is not None:
+                    print(f"DEBUG Pattern weights gradient norm: {grad.norm().item():.8f}")
+                else:
+                    print("DEBUG Pattern weights gradient is None!")
+            pattern_weights.register_hook(grad_hook)
+    
+
         # create pattern masks (binary), expand to broadcast shapes
         local_mask_bin = self.create_local_mask(L, device).unsqueeze(0).unsqueeze(0)  # (1,1,L,L)
         global_mask_bin = self.create_global_mask(L, device).unsqueeze(0).unsqueeze(0)  # (1,1,L,L)
