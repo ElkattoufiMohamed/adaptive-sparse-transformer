@@ -2,7 +2,7 @@
 model:
   vocab_size: 30522 # BERT tokenizer vocab size
   dim: 768
-  depth: 6
+  depth: 8
   num_heads: 12
   mlp_ratio: 4.0
   max_seq_len: 512
@@ -18,13 +18,13 @@ attention:
 
 # Training configuration
 training:
-  batch_size: 4
+  batch_size: 8
   learning_rate: 0.0001
-  num_epochs: 5
-  warmup_steps: 0
+  num_epochs: 15
+  warmup_steps: 500
   lr_scheduler: "constant"
   weight_decay: 0.01
-  gradient_clip_norm: false #1.0
+  gradient_clip_norm: 1.0
   save_steps: 1000
   eval_steps: 500
   logging_steps: 100
@@ -36,7 +36,7 @@ data:
   max_length: 256
   train_split: "train"
   eval_split: "test"
-  num_workers: 4
+  num_workers: 8
 
 # Experiment tracking
 wandb:
@@ -46,7 +46,7 @@ wandb:
 
 # Evaluation Configuration
 evaluation:
-  eval_steps: 500
+  eval_steps: 200
   eval_batch_size: 4
   save_best_model: true
   early_stopping_patience: 10
@@ -54,8 +54,8 @@ evaluation:
   save_steps: 1000
   logging_steps: 100
   max_eval_samples: null
-  metric_for_best_model: "loss"
-  greater_is_better: false
+  metric_for_best_model: "accuracy"
+  greater_is_better: true
 
 # Hardware Configuration
 hardware:
@@ -65,4 +65,4 @@ hardware:
   pin_memory: false
 
 scheduler:
-  type: "none"
+  type: "cosine"
