@@ -205,7 +205,6 @@ class AdaptiveTransformerTrainer:
 
         if not torch.isfinite(loss):
             logger.critical("NaN/Inf loss detected - skipping this batch (global_step=%d)", self.global_step)
-            # ensure grads cleared so we don't accumulate anything unexpected
             self.optimizer.zero_grad(set_to_none=True)
             return {"loss": float("nan"), "accuracy": 0.0, "learning_rate": self.optimizer.param_groups[0]["lr"]}
 
