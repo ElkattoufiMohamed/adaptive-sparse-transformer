@@ -49,11 +49,9 @@ class AdaptiveSparseAttention(nn.Module):
         # Pattern selector: sequence-level MLP -> (local, global, sparse) logits
         # Removed softmax - apply with temperature in forward()
         self.pattern_selector = nn.Sequential(
-            nn.Linear(dim, dim),      # Larger hidden layer for better capacity
+            nn.Linear(dim, dim // 2),  # Larger hidden layer
             nn.ReLU(),
-            nn.Dropout(0.2),          # Higher dropout for regularization
-            nn.Linear(dim, dim // 2), # Additional layer for complexity
-            nn.ReLU(),
+            nn.Dropout(0.1),  # Add dropout for regularization
             nn.Linear(dim // 2, 3),   # Output raw logits
         )
 
@@ -68,19 +66,12 @@ class AdaptiveSparseAttention(nn.Module):
 
     def _init_weights(self):
         """Initialize weights with proper scaling for learning."""
-        # Pattern selector - use larger initialization to encourage diversity
-        for i, module in enumerate(self.pattern_selector):
+        # Pattern selector - use normal initialization with proper scaling
+        for module in self.pattern_selector:
             if isinstance(module, nn.Linear):
-                if i == len(self.pattern_selector) - 1:  # Last layer - output layer
-                    # Initialize with bias toward different patterns
-                    nn.init.xavier_normal_(module.weight, gain=2.0)
-                    if module.bias is not None:
-                        # Bias toward different patterns: local=0.5, global=-0.5, sparse=0
-                        module.bias.data = torch.tensor([0.5, -0.5, 0.0])
-                else:
-                    nn.init.xavier_normal_(module.weight, gain=1.5)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
+                nn.init.xavier_normal_(module.weight, gain=1.0)  # Standard gain
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
         # QKV and projection layers - conservative but not too small
         nn.init.xavier_normal_(self.qkv.weight, gain=0.5)
@@ -153,47 +144,16 @@ class AdaptiveSparseAttention(nn.Module):
         # Compute attention scores
         attention_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # Pattern selection with temperature and additional processing
+        # Pattern selection with temperature
         pooled_features = torch.mean(x, dim=1)  # (B, D)
-        
-        # Add positional information to help distinguish sequence patterns
-        seq_length_feature = torch.tensor([L], device=device, dtype=torch.float32).expand(B, 1)
-        seq_length_normalized = seq_length_feature / 512.0  # Normalize by max expected length
-        
-        # Concatenate sequence-level features
-        enhanced_features = torch.cat([pooled_features, seq_length_normalized], dim=1)
-        
-        # Pad enhanced_features to match expected input size or adjust pattern_selector
-        if enhanced_features.size(1) != self.dim:
-            # Use only pooled features for now, but keep this for future enhancement
-            pattern_input = pooled_features
-        else:
-            pattern_input = enhanced_features
-            
-        pattern_logits = self.pattern_selector(pattern_input)  # (B, 3)
-        
-        # Add learnable pattern bias to encourage diversity
-        if not hasattr(self, 'pattern_bias'):
-            self.register_parameter('pattern_bias', nn.Parameter(torch.tensor([0.2, -0.1, -0.1])))
-        
-        pattern_logits = pattern_logits + self.pattern_bias.unsqueeze(0)
+        pattern_logits = self.pattern_selector(pooled_features)  # (B, 3)
         pattern_weights = F.softmax(pattern_logits / self.pattern_temperature, dim=-1)  # Sharp selection
 
-        # Enhanced debugging with gradient tracking
-        if self.training and torch.rand(1).item() < 0.05:  # Debug 5% of the time
+        # Add debugging in training mode
+        if self.training and torch.rand(1).item() < 0.01:  # Debug 1% of the time
             print(f"DEBUG Pattern logits: {pattern_logits[0].detach().cpu().numpy()}")
             print(f"DEBUG Pattern weights: {pattern_weights[0].detach().cpu().numpy()}")
             print(f"DEBUG Pattern logits std: {pattern_logits.std().item():.6f}")
-            print(f"DEBUG Pooled features std: {pooled_features.std().item():.6f}")
-            
-            # Register hook to track gradients
-            if pattern_logits.requires_grad:
-                def grad_hook(grad):
-                    if grad is not None:
-                        print(f"DEBUG Pattern logits grad norm: {grad.norm().item():.8f}")
-                    else:
-                        print("DEBUG Pattern logits grad is None!")
-                pattern_logits.register_hook(grad_hook)
 
         # Create binary pattern masks
         local_mask = self.create_local_mask(L, device)  # (L, L)
