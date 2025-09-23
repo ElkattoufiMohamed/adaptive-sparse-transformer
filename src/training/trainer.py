@@ -18,6 +18,8 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Optional: efficiency metrics helper (may be unused)
 try:
