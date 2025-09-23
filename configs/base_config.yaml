@@ -20,7 +20,7 @@ attention:
 training:
   batch_size: 8
   learning_rate: 0.0001
-  num_epochs: 15
+  num_epochs: 30
   warmup_steps: 500
   lr_scheduler: "constant"
   weight_decay: 0.01
