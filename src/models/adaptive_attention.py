@@ -25,7 +25,7 @@ class AdaptiveSparseAttention(nn.Module):
         global_ratio: float = 0.1,
         learnable_sparsity: bool = True,
         temperature: float = 1.0,
-        pattern_temperature: float = 0.5,  # Temperature for pattern selection sharpening
+        pattern_temperature: float = 0.3,  # Lower temperature for sharper selection
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -46,14 +46,18 @@ class AdaptiveSparseAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.dropout_layer = nn.Dropout(self.dropout_p)
 
-        # Pattern selector: sequence-level MLP -> (local, global, sparse) logits
-        # Removed softmax - apply with temperature in forward()
+        # Pattern selector: deeper network for better pattern recognition
         self.pattern_selector = nn.Sequential(
-            nn.Linear(dim, dim // 2),  # Larger hidden layer
+            nn.Linear(dim, dim),          # Larger first layer
             nn.ReLU(),
-            nn.Dropout(0.1),  # Add dropout for regularization
-            nn.Linear(dim // 2, 3),   # Output raw logits
+            nn.Dropout(0.2),             # Higher dropout
+            nn.Linear(dim, dim // 2),    # Second layer
+            nn.ReLU(),
+            nn.Linear(dim // 2, 3),      # Output logits
         )
+
+        # Learnable pattern bias to break symmetry
+        self.pattern_bias = nn.Parameter(torch.tensor([0.2, -0.1, -0.1]))
 
         # Per-head learnable sparsity parameters
         self.learnable_sparsity = learnable_sparsity
@@ -65,21 +69,28 @@ class AdaptiveSparseAttention(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights with proper scaling for learning."""
-        # Pattern selector - use normal initialization with proper scaling
-        for module in self.pattern_selector:
+        """Initialize weights with aggressive biases to break pattern symmetry."""
+        # Pattern selector - use larger initialization and biased final layer
+        for i, module in enumerate(self.pattern_selector):
             if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight, gain=1.0)  # Standard gain
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                if i == len(self.pattern_selector) - 1:  # Final output layer
+                    # Large gain to ensure strong initial logits
+                    nn.init.xavier_normal_(module.weight, gain=3.0)
+                    if module.bias is not None:
+                        # Strong bias toward local pattern initially
+                        module.bias.data = torch.tensor([1.0, -0.5, -0.5])
+                else:
+                    nn.init.xavier_normal_(module.weight, gain=1.5)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
-        # QKV and projection layers - conservative but not too small
+        # QKV and projection layers
         nn.init.xavier_normal_(self.qkv.weight, gain=0.5)
         nn.init.xavier_normal_(self.proj.weight, gain=0.5)
         
         # Sparse pattern parameters
         if self.learnable_sparsity:
-            nn.init.normal_(self.sparse_pattern_weights, mean=0.0, std=0.2)
+            nn.init.normal_(self.sparse_pattern_weights, mean=0.0, std=0.3)
             nn.init.zeros_(self.sparse_bias)
 
     def create_local_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -111,7 +122,7 @@ class AdaptiveSparseAttention(nn.Module):
         else:
             scores = attention_scores
 
-        # Top-k selection with small jitter to break ties
+        # Top-k selection with jitter to break ties
         jitter = torch.randn_like(scores) * 1e-6
         scores_jittered = scores + jitter
         
@@ -144,16 +155,36 @@ class AdaptiveSparseAttention(nn.Module):
         # Compute attention scores
         attention_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # Pattern selection with temperature
+        # Enhanced pattern selection
         pooled_features = torch.mean(x, dim=1)  # (B, D)
+        
+        # Add sequence length as additional feature
+        seq_length_feature = torch.full((B, 1), L / 512.0, device=device, dtype=x.dtype)
+        
+        # For now, use only pooled features (can enhance later)
         pattern_logits = self.pattern_selector(pooled_features)  # (B, 3)
-        pattern_weights = F.softmax(pattern_logits / self.pattern_temperature, dim=-1)  # Sharp selection
+        
+        # Add learnable bias to break symmetry
+        pattern_logits = pattern_logits + self.pattern_bias.unsqueeze(0)
+        
+        # Apply sharp temperature for decisive selection
+        pattern_weights = F.softmax(pattern_logits / self.pattern_temperature, dim=-1)
 
-        # Add debugging in training mode
-        if self.training and torch.rand(1).item() < 0.01:  # Debug 1% of the time
+        # Enhanced debugging with gradient tracking
+        if self.training and torch.rand(1).item() < 0.05:  # Debug 5% of batches
             print(f"DEBUG Pattern logits: {pattern_logits[0].detach().cpu().numpy()}")
             print(f"DEBUG Pattern weights: {pattern_weights[0].detach().cpu().numpy()}")
             print(f"DEBUG Pattern logits std: {pattern_logits.std().item():.6f}")
+            print(f"DEBUG Pooled features std: {pooled_features.std().item():.6f}")
+            
+            # Track gradients
+            if pattern_logits.requires_grad:
+                def grad_hook(grad):
+                    if grad is not None:
+                        print(f"DEBUG Pattern logits grad norm: {grad.norm().item():.8f}")
+                    else:
+                        print("DEBUG Pattern logits grad is None!")
+                pattern_logits.register_hook(grad_hook)
 
         # Create binary pattern masks
         local_mask = self.create_local_mask(L, device)  # (L, L)
@@ -166,15 +197,14 @@ class AdaptiveSparseAttention(nn.Module):
         pw_sparse = pattern_weights[:, 2].view(B, 1, 1, 1)
 
         # Combine masks using weighted combination
-        # Each pattern contributes proportionally to its weight
         combined_mask = (
             pw_local * local_mask.unsqueeze(0).unsqueeze(0) +    # (B, H, L, L)
             pw_global * global_mask.unsqueeze(0).unsqueeze(0) +  # (B, H, L, L)
             pw_sparse * sparse_mask                               # (B, H, L, L)
         )
 
-        # Apply combined mask - positions with weight > threshold are allowed
-        threshold = 0.1  # Allow positions if any pattern gives them decent weight
+        # Apply combined mask - threshold for attention positions
+        threshold = 0.05  # Lower threshold for more selective attention
         attention_mask = combined_mask > threshold
 
         # Mask attention scores
@@ -193,10 +223,10 @@ class AdaptiveSparseAttention(nn.Module):
             key_mask = mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, L)
             attention_scores = attention_scores.masked_fill(key_mask == 0, float('-inf'))
 
-        # Handle fully masked rows (all -inf) - set first position to 0
+        # Handle fully masked rows - repair by unmasking first position
         all_masked = (attention_scores == float('-inf')).all(dim=-1)  # (B, H, L)
         if all_masked.any():
-            attention_scores = attention_scores.clone()  # Avoid in-place modification
+            attention_scores = attention_scores.clone()
             attention_scores[all_masked, 0] = 0.0
 
         # Apply attention with temperature
@@ -208,12 +238,19 @@ class AdaptiveSparseAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, L, D)  # (B, L, D)
         out = self.proj(out)
 
-        # Calculate pattern diversity loss to encourage specialization
+        # Enhanced diversity losses
         pattern_entropy = -(pattern_weights * torch.log(pattern_weights + 1e-8)).sum(dim=-1)
         avg_entropy = pattern_entropy.mean()
-        diversity_loss = -avg_entropy  # Negative entropy encourages diversity
+        
+        # Strong diversity penalty
+        max_entropy = math.log(3.0)
+        diversity_loss = -(avg_entropy - max_entropy * 0.3)  # Encourage high entropy
+        
+        # Pattern specialization loss - penalize uniform usage across batch
+        pattern_mean = pattern_weights.mean(dim=0)  # (3,) - average usage per pattern
+        specialization_loss = -((pattern_mean - 1.0/3.0)**2).sum()  # Penalize uniform
 
-        # Attention info for logging
+        # Attention info for logging and loss computation
         attention_info = {
             "pattern_weights": pattern_weights,  # (B, 3)
             "attention_weights": attention_weights,  # (B, H, L, L)
@@ -221,7 +258,10 @@ class AdaptiveSparseAttention(nn.Module):
             "global_ratio": float(pattern_weights[:, 1].mean().item()),
             "sparse_ratio": float(pattern_weights[:, 2].mean().item()),
             "diversity_loss": diversity_loss,
+            "specialization_loss": specialization_loss,
             "pattern_entropy": avg_entropy,
+            "pattern_logits_std": pattern_logits.std().item(),
+            "total_pattern_loss": diversity_loss + 0.1 * specialization_loss,  # Combined loss
         }
 
         return out, attention_info
