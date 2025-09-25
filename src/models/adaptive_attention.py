@@ -26,6 +26,7 @@ class AdaptiveSparseAttention(nn.Module):
         learnable_sparsity: bool = True,
         temperature: float = 1.0,
         pattern_temperature: float = 0.3,  # Lower temperature for sharper selection
+        enable_pattern_perturbation: bool = True,  # Enable random pattern perturbation
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -40,6 +41,7 @@ class AdaptiveSparseAttention(nn.Module):
         self.global_ratio = global_ratio
         self.temperature = temperature
         self.pattern_temperature = pattern_temperature
+        self.enable_pattern_perturbation = enable_pattern_perturbation
 
         # QKV and output projection
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -50,14 +52,15 @@ class AdaptiveSparseAttention(nn.Module):
         self.pattern_selector = nn.Sequential(
             nn.Linear(dim, dim),          # Larger first layer
             nn.ReLU(),
-            nn.Dropout(0.2),             # Higher dropout
+            nn.Dropout(0.3),             # Higher dropout to prevent overfitting
             nn.Linear(dim, dim // 2),    # Second layer
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(dim // 2, 3),      # Output logits
         )
 
-        # Learnable pattern bias to break symmetry
-        self.pattern_bias = nn.Parameter(torch.tensor([0.2, -0.1, -0.1]))
+        # Learnable pattern bias to break symmetry - initialized with stronger bias
+        self.pattern_bias = nn.Parameter(torch.tensor([0.5, -0.3, -0.2]))
 
         # Per-head learnable sparsity parameters
         self.learnable_sparsity = learnable_sparsity
@@ -74,15 +77,15 @@ class AdaptiveSparseAttention(nn.Module):
         for i, module in enumerate(self.pattern_selector):
             if isinstance(module, nn.Linear):
                 if i == len(self.pattern_selector) - 1:  # Final output layer
-                    # Large gain to ensure strong initial logits
-                    nn.init.xavier_normal_(module.weight, gain=3.0)
+                    # Very large gain to ensure strong initial logits
+                    nn.init.xavier_normal_(module.weight, gain=5.0)
                     if module.bias is not None:
-                        # Strong bias toward local pattern initially
-                        module.bias.data = torch.tensor([1.0, -0.5, -0.5])
+                        # Very strong bias toward local pattern initially
+                        module.bias.data = torch.tensor([1.5, -0.8, -0.7])
                 else:
-                    nn.init.xavier_normal_(module.weight, gain=1.5)
+                    nn.init.xavier_normal_(module.weight, gain=2.0)
                     if module.bias is not None:
-                        nn.init.zeros_(module.bias)
+                        nn.init.normal_(module.bias, mean=0.0, std=0.1)
 
         # QKV and projection layers
         nn.init.xavier_normal_(self.qkv.weight, gain=0.5)
@@ -90,8 +93,20 @@ class AdaptiveSparseAttention(nn.Module):
         
         # Sparse pattern parameters
         if self.learnable_sparsity:
-            nn.init.normal_(self.sparse_pattern_weights, mean=0.0, std=0.3)
-            nn.init.zeros_(self.sparse_bias)
+            nn.init.normal_(self.sparse_pattern_weights, mean=0.0, std=0.5)
+            nn.init.normal_(self.sparse_bias, mean=0.0, std=0.1)
+
+    def get_pattern_parameters(self):
+        """Return parameters specific to pattern selection for separate optimization."""
+        pattern_params = []
+        pattern_params.extend(self.pattern_selector.parameters())
+        pattern_params.append(self.pattern_bias)
+        return pattern_params
+
+    def get_non_pattern_parameters(self):
+        """Return all parameters except pattern selection ones."""
+        pattern_param_ids = {id(p) for p in self.get_pattern_parameters()}
+        return [p for p in self.parameters() if id(p) not in pattern_param_ids]
 
     def create_local_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Binary local mask (seq_len, seq_len) with 1 where attention is allowed."""
@@ -155,36 +170,72 @@ class AdaptiveSparseAttention(nn.Module):
         # Compute attention scores
         attention_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # Enhanced pattern selection
+        # Enhanced pattern selection with features
         pooled_features = torch.mean(x, dim=1)  # (B, D)
         
-        # Add sequence length as additional feature
+        # Add sequence length and variance as additional features
         seq_length_feature = torch.full((B, 1), L / 512.0, device=device, dtype=x.dtype)
+        seq_variance = torch.var(x, dim=1, keepdim=True).mean(dim=-1, keepdim=True)  # (B, 1)
         
-        # For now, use only pooled features (can enhance later)
-        pattern_logits = self.pattern_selector(pooled_features)  # (B, 3)
+        # Enhance pooled features with additional information
+        enhanced_features = torch.cat([
+            pooled_features,
+            seq_length_feature,
+            seq_variance
+        ], dim=1)
+        
+        # Project enhanced features back to original dimension for pattern selector
+        if enhanced_features.size(1) != self.dim:
+            # Simple projection to match expected input size
+            projection = nn.Linear(enhanced_features.size(1), self.dim).to(device)
+            pattern_input = projection(enhanced_features)
+        else:
+            pattern_input = enhanced_features
+        
+        # Get pattern logits
+        pattern_logits = self.pattern_selector(pattern_input)  # (B, 3)
         
         # Add learnable bias to break symmetry
         pattern_logits = pattern_logits + self.pattern_bias.unsqueeze(0)
         
+        # Apply random perturbation during training to prevent freezing
+        if self.training and self.enable_pattern_perturbation:
+            if torch.rand(1).item() < 0.02:  # 2% of training steps
+                perturbation = torch.randn_like(self.pattern_bias) * 0.2
+                self.pattern_bias.data += perturbation
+                logger.debug(f"Applied pattern bias perturbation: {perturbation}")
+        
         # Apply sharp temperature for decisive selection
         pattern_weights = F.softmax(pattern_logits / self.pattern_temperature, dim=-1)
 
-        # Enhanced debugging with gradient tracking
-        if self.training and torch.rand(1).item() < 0.05:  # Debug 5% of batches
+        # Enhanced debugging with comprehensive gradient tracking
+        if self.training and torch.rand(1).item() < 0.1:  # Debug 10% of batches
             print(f"DEBUG Pattern logits: {pattern_logits[0].detach().cpu().numpy()}")
             print(f"DEBUG Pattern weights: {pattern_weights[0].detach().cpu().numpy()}")
             print(f"DEBUG Pattern logits std: {pattern_logits.std().item():.6f}")
+            print(f"DEBUG Pattern bias: {self.pattern_bias.detach().cpu().numpy()}")
             print(f"DEBUG Pooled features std: {pooled_features.std().item():.6f}")
             
-            # Track gradients
+            # Track gradients for pattern selector
+            def pattern_grad_hook(grad):
+                if grad is not None:
+                    print(f"DEBUG Pattern logits grad norm: {grad.norm().item():.8f}")
+                    print(f"DEBUG Pattern logits grad mean: {grad.mean().item():.8f}")
+                else:
+                    print("DEBUG Pattern logits grad is None!")
+            
             if pattern_logits.requires_grad:
-                def grad_hook(grad):
-                    if grad is not None:
-                        print(f"DEBUG Pattern logits grad norm: {grad.norm().item():.8f}")
-                    else:
-                        print("DEBUG Pattern logits grad is None!")
-                pattern_logits.register_hook(grad_hook)
+                pattern_logits.register_hook(pattern_grad_hook)
+            
+            # Track pattern bias gradients
+            def bias_grad_hook(grad):
+                if grad is not None:
+                    print(f"DEBUG Pattern bias grad norm: {grad.norm().item():.8f}")
+                else:
+                    print("DEBUG Pattern bias grad is None!")
+                    
+            if self.pattern_bias.requires_grad:
+                self.pattern_bias.register_hook(bias_grad_hook)
 
         # Create binary pattern masks
         local_mask = self.create_local_mask(L, device)  # (L, L)
@@ -204,7 +255,7 @@ class AdaptiveSparseAttention(nn.Module):
         )
 
         # Apply combined mask - threshold for attention positions
-        threshold = 0.05  # Lower threshold for more selective attention
+        threshold = 0.02  # Very low threshold for more selective attention
         attention_mask = combined_mask > threshold
 
         # Mask attention scores
@@ -238,17 +289,25 @@ class AdaptiveSparseAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, L, D)  # (B, L, D)
         out = self.proj(out)
 
-        # Enhanced diversity losses
+        # Enhanced diversity losses with stronger penalties
         pattern_entropy = -(pattern_weights * torch.log(pattern_weights + 1e-8)).sum(dim=-1)
         avg_entropy = pattern_entropy.mean()
         
-        # Strong diversity penalty
+        # Very strong diversity penalty - heavily penalize low entropy
         max_entropy = math.log(3.0)
-        diversity_loss = -(avg_entropy - max_entropy * 0.3)  # Encourage high entropy
+        diversity_loss = -2.0 * (avg_entropy - max_entropy * 0.5)  # Stronger penalty
         
-        # Pattern specialization loss - penalize uniform usage across batch
+        # Pattern specialization loss - encourage different usage across batch
         pattern_mean = pattern_weights.mean(dim=0)  # (3,) - average usage per pattern
-        specialization_loss = -((pattern_mean - 1.0/3.0)**2).sum()  # Penalize uniform
+        target_dist = torch.tensor([0.5, 0.25, 0.25], device=device)  # Target distribution
+        specialization_loss = -5.0 * ((pattern_mean - target_dist)**2).sum()  # Strong penalty
+        
+        # Pattern variance loss - encourage high variance in pattern selection
+        pattern_var = pattern_weights.var(dim=0).sum()  # Sum of variances across patterns
+        variance_loss = -pattern_var  # Encourage high variance
+        
+        # Combined pattern learning loss
+        total_pattern_loss = diversity_loss + specialization_loss + 0.5 * variance_loss
 
         # Attention info for logging and loss computation
         attention_info = {
@@ -259,9 +318,11 @@ class AdaptiveSparseAttention(nn.Module):
             "sparse_ratio": float(pattern_weights[:, 2].mean().item()),
             "diversity_loss": diversity_loss,
             "specialization_loss": specialization_loss,
+            "variance_loss": variance_loss,
             "pattern_entropy": avg_entropy,
             "pattern_logits_std": pattern_logits.std().item(),
-            "total_pattern_loss": diversity_loss + 0.1 * specialization_loss,  # Combined loss
+            "total_pattern_loss": total_pattern_loss,
+            "pattern_bias": self.pattern_bias.clone(),  # For monitoring
         }
 
         return out, attention_info
@@ -280,3 +341,48 @@ class MultiHeadAdaptiveAttention(nn.Module):
 
     def forward(self, x, mask=None):
         return self.attention(x, mask)
+
+    def get_pattern_parameters(self):
+        """Expose pattern parameters for separate optimization."""
+        return self.attention.get_pattern_parameters()
+    
+    def get_non_pattern_parameters(self):
+        """Expose non-pattern parameters for separate optimization."""
+        return self.attention.get_non_pattern_parameters()
+
+
+# Helper function to create separate optimizers
+def create_separate_optimizers(model, main_lr=1e-4, pattern_lr=1e-2):
+    """
+    Create separate optimizers for pattern selector and other parameters.
+    
+    Args:
+        model: The transformer model containing adaptive attention
+        main_lr: Learning rate for main model parameters
+        pattern_lr: Learning rate for pattern selector (should be much higher)
+    
+    Returns:
+        main_optimizer, pattern_optimizer
+    """
+    # Collect pattern selector parameters from all adaptive attention modules
+    pattern_params = []
+    main_params = []
+    
+    for module in model.modules():
+        if isinstance(module, (AdaptiveSparseAttention, MultiHeadAdaptiveAttention)):
+            if hasattr(module, 'get_pattern_parameters'):
+                pattern_params.extend(module.get_pattern_parameters())
+            if hasattr(module, 'get_non_pattern_parameters'):
+                main_params.extend(module.get_non_pattern_parameters())
+    
+    # If no adaptive attention modules found, fall back to parameter name filtering
+    if not pattern_params:
+        pattern_params = [p for name, p in model.named_parameters() 
+                         if any(keyword in name for keyword in ['pattern_selector', 'pattern_bias'])]
+        main_params = [p for name, p in model.named_parameters() 
+                      if not any(keyword in name for keyword in ['pattern_selector', 'pattern_bias'])]
+    
+    main_optimizer = torch.optim.AdamW(main_params, lr=main_lr, weight_decay=0.01)
+    pattern_optimizer = torch.optim.AdamW(pattern_params, lr=pattern_lr, weight_decay=0.001)
+    
+    return main_optimizer, pattern_optimizer
