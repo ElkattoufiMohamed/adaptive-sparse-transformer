@@ -93,26 +93,51 @@ class AdaptiveTransformerTrainer:
     # Setup helpers
     # ----------------------
     def _setup_optimizer(self) -> None:
-        """Initialize optimizer with parameter grouping."""
+        """Initialize optimizer with separate learning rates for pattern selector."""
         training_config = self.config["training"]
-
-        no_decay = ["bias", "LayerNorm.weight", "norm.weight"]
-        params_decay = [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)]
-        params_nodecay = [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)]
-
+        
+        # Separate pattern selector parameters from others
+        pattern_params = []
+        pattern_param_names = []
+        other_params = []
+        other_param_names = []
+        
+        for name, param in self.model.named_parameters():
+            if 'pattern_selector' in name or 'pattern_bias' in name:
+                pattern_params.append(param)
+                pattern_param_names.append(name)
+            else:
+                other_params.append(param)
+                other_param_names.append(name)
+        
+        # Log parameter groups
+        logger.info(f"Pattern selector parameters ({len(pattern_params)}): {pattern_param_names[:3]}...")
+        logger.info(f"Other parameters: {len(other_params)}")
+        
+        # Create parameter groups with different learning rates
+        base_lr = float(training_config.get("learning_rate", 1e-4))
+        pattern_lr_multiplier = float(training_config.get("pattern_lr_multiplier", 10.0))
+        
         optimizer_grouped_parameters = [
-            {"params": params_decay, "weight_decay": float(training_config.get("weight_decay", 0.0))},
-            {"params": params_nodecay, "weight_decay": 0.0},
+            {
+                'params': other_params,
+                'lr': base_lr,
+                'weight_decay': float(training_config.get("weight_decay", 0.01))
+            },
+            {
+                'params': pattern_params,
+                'lr': base_lr * pattern_lr_multiplier,  # 10x higher LR by default
+                'weight_decay': 0.0,  # No weight decay for pattern selector
+            }
         ]
-
+        
         self.optimizer = optim.AdamW(
             optimizer_grouped_parameters,
-            lr=float(training_config.get("learning_rate", 1e-4)),
             betas=(0.9, 0.999),
             eps=1e-8,
         )
-
-        logger.info(f"Optimizer: AdamW with LR={training_config.get('learning_rate', 1e-4)}")
+        
+        logger.info(f"Optimizer: AdamW with base LR={base_lr}, pattern selector LR={base_lr * pattern_lr_multiplier}")
 
     def _setup_scheduler(self) -> None:
         """Initialize the learning rate scheduler (transformers schedulers)."""
@@ -167,7 +192,7 @@ class AdaptiveTransformerTrainer:
     # Main training step
     # ----------------------
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Execute a single training step and return metrics for that step."""
+        """Execute a single training step with pattern loss integration."""
         self.model.train()
 
         # Move batch to device
@@ -185,25 +210,68 @@ class AdaptiveTransformerTrainer:
 
         # Forward (with AMP if enabled)
         with autocast(enabled=self.use_amp):
-            outputs = self.model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask", None), return_attention_info=True)
+            outputs = self.model(
+                input_ids=batch["input_ids"], 
+                attention_mask=batch.get("attention_mask", None), 
+                return_attention_info=True
+            )
             logits = outputs["logits"]
 
-            # Select loss function by name (for future extensibility)
+            # Task loss
             if self.loss_name == "cross_entropy":
                 loss_f = nn.CrossEntropyLoss()
-                loss = loss_f(logits, batch["labels"])
+                task_loss = loss_f(logits, batch["labels"])
             else:
-                # fallback
                 loss_f = nn.CrossEntropyLoss()
-                loss = loss_f(logits, batch["labels"])
+                task_loss = loss_f(logits, batch["labels"])
+            
+            # Aggregate pattern losses from all attention layers
+            pattern_loss = torch.tensor(0.0, device=self.device, dtype=task_loss.dtype)
+            pattern_metrics = {}
+            
+            if 'attention_info' in outputs and outputs['attention_info']:
+                total_pattern_loss = 0.0
+                num_valid_layers = 0
+                
+                for i, layer_info in enumerate(outputs['attention_info']):
+                    if layer_info and 'total_pattern_loss' in layer_info:
+                        # Convert to tensor if needed
+                        layer_pattern_loss = layer_info['total_pattern_loss']
+                        if not isinstance(layer_pattern_loss, torch.Tensor):
+                            layer_pattern_loss = torch.tensor(layer_pattern_loss, device=self.device)
+                        
+                        total_pattern_loss += layer_pattern_loss
+                        num_valid_layers += 1
+                        
+                        # Track individual loss components from first layer for logging
+                        if i == 0:
+                            for key in ['diversity_loss', 'variance_loss', 'consistency_loss', 
+                                    'underuse_penalty', 'decisiveness_loss']:
+                                if key in layer_info:
+                                    val = layer_info[key]
+                                    if isinstance(val, torch.Tensor):
+                                        pattern_metrics[f'pattern_{key}'] = float(val.item())
+                                    else:
+                                        pattern_metrics[f'pattern_{key}'] = float(val)
+                
+                # Average pattern loss across layers
+                if num_valid_layers > 0:
+                    pattern_loss = total_pattern_loss / num_valid_layers
+            
+            # Ramp up pattern loss weight over training
+            # Start small and gradually increase to full weight
+            ramp_up_steps = 5000
+            max_pattern_weight = 0.2  # Maximum weight for pattern loss
+            pattern_weight = min(max_pattern_weight, max_pattern_weight * (self.global_step / ramp_up_steps))
+            
+            # Combined loss
+            loss = task_loss + pattern_weight * pattern_loss
 
         # Log numeric checks
-        logger.debug("Raw loss = %.6f", float(loss.item()))
+        logger.debug("Task loss = %.6f, Pattern loss = %.6f, Total loss = %.6f", 
+                    float(task_loss.item()), float(pattern_loss.item()), float(loss.item()))
+        logger.debug("Pattern weight = %.4f", pattern_weight)
         logger.debug("Loss finite: %s", torch.isfinite(loss).item())
-        try:
-            logger.debug("Logits range: [%.6f, %.6f], mean=%.6f", float(logits.min().item()), float(logits.max().item()), float(logits.mean().item()))
-        except Exception:
-            logger.debug("Couldn't compute logits min/max/mean (possible NaN)")
 
         if not torch.isfinite(loss):
             logger.critical("NaN/Inf loss detected - skipping this batch (global_step=%d)", self.global_step)
@@ -221,6 +289,15 @@ class AdaptiveTransformerTrainer:
             if self.gradient_clip_norm and self.gradient_clip_norm > 0.0:
                 total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
                 logger.debug("Gradient norm after clipping (AMP): %.6f", float(total_norm))
+            
+            # Check pattern selector gradients specifically
+            for name, param in self.model.named_parameters():
+                if 'pattern_selector' in name and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    if self.global_step % 100 == 0:  # Log every 100 steps
+                        logger.debug(f"Pattern selector gradient norm for {name}: {grad_norm:.8f}")
+                    break
+            
             # step optimizer w/ scaler
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -229,6 +306,15 @@ class AdaptiveTransformerTrainer:
             if self.gradient_clip_norm and self.gradient_clip_norm > 0.0:
                 total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
                 logger.debug("Gradient norm after clipping: %.6f", float(total_norm))
+            
+            # Check pattern selector gradients
+            for name, param in self.model.named_parameters():
+                if 'pattern_selector' in name and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    if self.global_step % 100 == 0:
+                        logger.debug(f"Pattern selector gradient norm for {name}: {grad_norm:.8f}")
+                    break
+            
             self.optimizer.step()
 
         # scheduler step after optimizer step
@@ -252,9 +338,14 @@ class AdaptiveTransformerTrainer:
 
         step_metrics: Dict[str, float] = {
             "loss": float(loss.item()),
+            "task_loss": float(task_loss.item()),
+            "pattern_loss": float(pattern_loss.item()),
+            "pattern_weight": float(pattern_weight),
             "accuracy": accuracy,
             "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
+            "pattern_lr": float(self.optimizer.param_groups[1]["lr"]) if len(self.optimizer.param_groups) > 1 else 0.0,
             **avg_attention_stats,
+            **pattern_metrics
         }
 
         return step_metrics
