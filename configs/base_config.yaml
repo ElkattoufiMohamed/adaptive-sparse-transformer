@@ -1,73 +1,66 @@
-# Base configuration for all experiments
 model:
   vocab_size: 30522
-  dim: 768
-  depth: 8
+  dim: 512 #768
+  depth: 4 #8
   num_heads: 12
   mlp_ratio: 4.0
   max_seq_len: 512
   dropout: 0.1
   num_classes: 2
 
-# Adaptive attention - UPDATED
 attention:
   local_window_size: 64
   global_ratio: 0.1
   learnable_sparsity: true
   temperature: 1.0
-  pattern_temperature: 1.0  # Start high
-  min_pattern_temperature: 0.3  # Anneal down to this
-  pattern_dropout: 0.1  # Lower dropout for pattern selector
+  pattern_temperature: 1.0 
+  min_pattern_temperature: 0.3 
+  pattern_dropout: 0.1 
 
-# Training configuration - UPDATED
 training:
-  batch_size: 16  # Increased for better pattern diversity
-  learning_rate: 0.0002  # Slightly higher base LR
-  pattern_lr_multiplier: 10.0  # Critical: 10x LR for pattern selector
+  batch_size: 16 
+  learning_rate: 0.0002 
+  pattern_lr_multiplier: 10.0 
   num_epochs: 30
-  warmup_steps: 1000  # Longer warmup for pattern learning
-  lr_scheduler: "cosine"  # Better than linear for this
+  warmup_steps: 1000 
+  lr_scheduler: "cosine" 
   weight_decay: 0.01
   gradient_clip_norm: 1.0
   save_steps: 1000
   eval_steps: 500
-  logging_steps: 50  # More frequent logging to track patterns
+  logging_steps: 50
   seed: 42
 
-# Data configuration - UPDATED
 data:
   dataset_name: "imdb"
   max_length: 256
   train_split: "train"
   eval_split: "test"
-  num_workers: 4  # Reduced from 8 to match hardware config
+  num_workers: 4 
 
-# Experiment tracking
 wandb:
   project: "adaptive-sparse-transformer"
   entity: "mohamedelkattoufi-fsm"
   tags: ["transformer", "attention", "sparse", "pattern-learning"]
   name: "adaptive_pattern_fix_v2"  # Track this specific fix
 
-# Evaluation Configuration - UPDATED
 evaluation:
-  eval_steps: 500  # Less frequent (was 200)
-  eval_batch_size: 16  # Match train batch size
+  eval_steps: 500 
+  eval_batch_size: 16 
   save_best_model: true
   early_stopping_patience: 10
   metrics_to_track: ["loss", "accuracy", "pattern_entropy", "pattern_diversity"]
   save_steps: 1000
   logging_steps: 50
-  max_eval_samples: 1000  # Limit eval for faster iteration
+  max_eval_samples: 1000
   metric_for_best_model: "accuracy"
   greater_is_better: true
 
-# Hardware Configuration
 hardware:
-  mixed_precision: true  # Enable for faster training
+  mixed_precision: true
   device: "auto"
   num_workers: 4
-  pin_memory: true  # Enable if using GPU
+  pin_memory: true
 
 scheduler:
   type: "cosine"
