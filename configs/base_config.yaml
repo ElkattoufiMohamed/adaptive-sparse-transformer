@@ -13,17 +13,17 @@ attention:
   global_ratio: 0.1
   learnable_sparsity: true
   temperature: 1.0
-  pattern_temperature: 1.0 
-  min_pattern_temperature: 0.3 
-  pattern_dropout: 0.1 
+  pattern_temperature: 1.0
+  min_pattern_temperature: 0.3
+  pattern_dropout: 0.1
 
 training:
-  batch_size: 16 
-  learning_rate: 0.0002 
-  pattern_lr_multiplier: 10.0 
-  num_epochs: 30
-  warmup_steps: 1000 
-  lr_scheduler: "cosine" 
+  batch_size: 16
+  learning_rate: 0.0002
+  pattern_lr_multiplier: 10.0
+  num_epochs: 100
+  warmup_steps: 1000
+  lr_scheduler: "cosine"
   weight_decay: 0.01
   gradient_clip_norm: 1.0
   save_steps: 1000
@@ -36,17 +36,17 @@ data:
   max_length: 256
   train_split: "train"
   eval_split: "test"
-  num_workers: 4 
+  num_workers: 4
 
 wandb:
   project: "adaptive-sparse-transformer"
   entity: "mohamedelkattoufi-fsm"
   tags: ["transformer", "attention", "sparse", "pattern-learning"]
-  name: "adaptive_pattern_fix_v2"  # Track this specific fix
+  name: "adaptive_pattern_fix_v2" # Track this specific fix
 
 evaluation:
-  eval_steps: 500 
-  eval_batch_size: 16 
+  eval_steps: 500
+  eval_batch_size: 16
   save_best_model: true
   early_stopping_patience: 10
   metrics_to_track: ["loss", "accuracy", "pattern_entropy", "pattern_diversity"]
