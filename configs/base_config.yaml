@@ -32,7 +32,7 @@ training:
   seed: 42
 
 data:
-  dataset_name: "cola"
+  dataset_name: "ag_news"
   max_length: 256
   train_split: "train"
   eval_split: "test"
