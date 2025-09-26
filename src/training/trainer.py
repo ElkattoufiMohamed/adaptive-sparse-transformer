@@ -262,7 +262,8 @@ class AdaptiveTransformerTrainer:
             # Start small and gradually increase to full weight
             ramp_up_steps = 5000
             max_pattern_weight = 0.2  # Maximum weight for pattern loss
-            pattern_weight = min(max_pattern_weight, max_pattern_weight * (self.global_step / ramp_up_steps))
+            ramp_progress = min(1.0, self.global_step / ramp_up_steps)
+            pattern_weight = max_pattern_weight * (1 - np.exp(-3 * ramp_progress))
             
             # Combined loss
             loss = task_loss + pattern_weight * pattern_loss
