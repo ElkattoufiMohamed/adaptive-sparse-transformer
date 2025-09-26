@@ -21,7 +21,7 @@ training:
   batch_size: 16
   learning_rate: 0.0002
   pattern_lr_multiplier: 10.0
-  num_epochs: 100
+  num_epochs: 30
   warmup_steps: 1000
   lr_scheduler: "cosine"
   weight_decay: 0.01
