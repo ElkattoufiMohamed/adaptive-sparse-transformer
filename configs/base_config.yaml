@@ -32,7 +32,7 @@ training:
   seed: 42
 
 data:
-  dataset_name: "imdb"
+  dataset_name: "cola"
   max_length: 256
   train_split: "train"
   eval_split: "test"
