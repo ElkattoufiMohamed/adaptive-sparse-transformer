@@ -1,6 +1,6 @@
 model:
   vocab_size: 30522
-  dim: 512 #768
+  dim: 768
   depth: 4 #8
   num_heads: 12
   mlp_ratio: 4.0
