@@ -19,6 +19,8 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import os
+import math
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Optional: efficiency metrics helper (may be unused)
@@ -140,37 +142,73 @@ class AdaptiveTransformerTrainer:
         logger.info(f"Optimizer: AdamW with base LR={base_lr}, pattern selector LR={base_lr * pattern_lr_multiplier}")
 
     def _setup_scheduler(self) -> None:
-        """Initialize the learning rate scheduler (transformers schedulers)."""
+        """Initialize the learning rate scheduler with special handling for pattern selector."""
         scheduler_config = self.config.get("scheduler", {})
         schedule_type = scheduler_config.get("type", "cosine")
-
+        
         total_steps = max(1, len(self.train_loader) * self.num_epochs)
         warmup_steps = int(self.config["training"].get("warmup_steps", 0))
-        # If warmup > total steps, clamp it to a small fraction
+        
         if warmup_steps >= total_steps:
             logger.warning("warmup_steps >= total_steps; clamping warmup_steps to 10% of total_steps")
             warmup_steps = max(1, total_steps // 10)
-
-        try:
-            if schedule_type == "cosine":
-                from transformers import get_cosine_schedule_with_warmup
-
-                self.scheduler = get_cosine_schedule_with_warmup(
-                    self.optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-                )
-            elif schedule_type == "linear":
-                from transformers import get_linear_schedule_with_warmup
-
-                self.scheduler = get_linear_schedule_with_warmup(
-                    self.optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-                )
-            else:
+        
+        # Check if we have pattern selector parameters (multiple param groups)
+        has_pattern_selector = len(self.optimizer.param_groups) > 1
+        
+        if has_pattern_selector:
+            # Create custom scheduler that only affects non-pattern parameters
+            logger.info("Creating scheduler with pattern selector exclusion")
+            
+            # Option 1: Use constant LR for pattern selector
+            def custom_lr_lambda(current_step: int, group_idx: int = 0):
+                # Pattern selector group (index 1) keeps constant LR
+                if group_idx == 1:
+                    return 1.0  # No decay for pattern selector
+                
+                # Regular parameters follow cosine schedule
+                if current_step < warmup_steps:
+                    return float(current_step) / float(max(1, warmup_steps))
+                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                
+                if schedule_type == "cosine":
+                    return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))  # Min 10% of initial LR
+                else:  # linear
+                    return max(0.1, 1.0 - progress * 0.9)  # Decay to 10% of initial
+            
+            from torch.optim.lr_scheduler import LambdaLR
+            
+            # Create lambdas for each parameter group
+            lr_lambdas = [
+                lambda step: custom_lr_lambda(step, 0),  # Regular params
+                lambda step: custom_lr_lambda(step, 1),  # Pattern params (constant)
+            ]
+            
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambdas)
+            
+            logger.info(f"Custom scheduler: regular params use {schedule_type}, pattern selector keeps constant LR")
+        
+        else:
+            # Standard scheduler for models without pattern selector
+            try:
+                if schedule_type == "cosine":
+                    from transformers import get_cosine_schedule_with_warmup
+                    self.scheduler = get_cosine_schedule_with_warmup(
+                        self.optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+                    )
+                elif schedule_type == "linear":
+                    from transformers import get_linear_schedule_with_warmup
+                    self.scheduler = get_linear_schedule_with_warmup(
+                        self.optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+                    )
+                else:
+                    self.scheduler = None
+            except Exception as e:
+                logger.exception("Failed to create scheduler: %s", e)
                 self.scheduler = None
-        except Exception as e:
-            logger.exception("Failed to create scheduler from transformers; scheduler disabled. Error: %s", e)
-            self.scheduler = None
-
+        
         logger.info(f"Scheduler: {schedule_type}, Warmup: {warmup_steps} steps, Total steps: {total_steps}")
+        
 
     def _setup_wandb(self) -> None:
         """Initialize weights & biases (if configured)."""
