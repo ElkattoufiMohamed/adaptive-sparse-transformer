@@ -1,297 +1,329 @@
-"""
-Comprehensive evaluation metrics for transformer models.
-Includes standard ML metrics plus efficiency analysis.
-"""
+# src/evaluation/metrics.py
+# Clean, dependency-light metrics & benchmarking utilities.
+# - No ellipses/truncations
+# - Stable imports only (torch, numpy)
+# - Exact keys used by train_adaptive.py ("improvements", "throughput_improvement_percent", etc.)
+
+from typing import Dict, Any, Optional, List, Tuple
+import time
+import math
 
 import torch
-import torch.nn as nn
-import time
 import numpy as np
-from typing import Dict, List, Tuple, Any
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 
-def compute_classification_metrics(
-    predictions: List[int],
-    labels: List[int],
-    num_classes: int = 2
-) -> Dict[str, float]:
-    """Compute standard and per-class classification metrics."""
-    predictions = np.array(predictions)
-    labels = np.array(labels)
-
-    accuracy = accuracy_score(labels, predictions)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        labels, predictions, average="weighted", zero_division=0
-    )
-
-    metrics = {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-    }
-
-    # Add per-class metrics for small class counts
-    if num_classes <= 10:
-        precision_per_class, recall_per_class, f1_per_class, _ = precision_recall_fscore_support(
-            labels, predictions, average=None, zero_division=0
-        )
-        for i in range(len(precision_per_class)):
-            metrics[f"precision_class_{i}"] = precision_per_class[i]
-            metrics[f"recall_class_{i}"] = recall_per_class[i]
-            metrics[f"f1_class_{i}"] = f1_per_class[i]
-
-    return metrics
-
-
-def compute_efficiency_metrics(
-    model: nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    device: torch.device,
-    num_batches: int = 10
-) -> Dict[str, float]:
+@torch.no_grad()
+def _model_step(model: torch.nn.Module, batch: Dict[str, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute efficiency metrics: inference time, throughput, memory usage.
+    Runs a forward step and returns (logits, labels).
+    Supports typical HF-style batches: input_ids, attention_mask, labels.
+    Falls back to passing the whole batch as **kwargs (except 'labels').
     """
+    labels = None
+    if "labels" in batch:
+        labels = batch["labels"].to(device)
 
+    # Move tensors to device
+    kw = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor) and k != "labels":
+            kw[k] = v.to(device)
+
+    logits = model(**kw)
+    # If model returns a tuple or dict, try common keys
+    if isinstance(logits, (list, tuple)):
+        logits = logits[0]
+    elif isinstance(logits, dict):
+        logits = logits.get("logits", next(iter(logits.values())))
+
+    return logits, labels
+
+
+def _preds_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    if logits.ndim == 3:
+        # e.g., sequence classification with pooled logits in last dim; take last position
+        logits = logits[:, -1, :]
+    return logits.argmax(dim=-1)
+
+
+def _compute_confusion(preds: np.ndarray, labels: np.ndarray, num_classes: Optional[int] = None) -> np.ndarray:
+    if num_classes is None:
+        num_classes = int(max(preds.max(initial=0), labels.max(initial=0))) + 1
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for p, y in zip(preds, labels):
+        if 0 <= y < num_classes and 0 <= p < num_classes:
+            cm[y, p] += 1
+    return cm
+
+
+def _safe_div(a: float, b: float) -> float:
+    return a / b if b != 0 else 0.0
+
+
+def _macro_f1(cm: np.ndarray) -> float:
+    # per-class precision/recall/f1, then unweighted mean over classes that appear
+    f1s = []
+    for k in range(cm.shape[0]):
+        tp = cm[k, k]
+        fp = cm[:, k].sum() - tp
+        fn = cm[k, :].sum() - tp
+        precision = _safe_div(tp, tp + fp)
+        recall = _safe_div(tp, tp + fn)
+        f1 = _safe_div(2 * precision * recall, precision + recall) if (precision + recall) else 0.0
+        # include class even if absent; macro-F1 commonly includes all
+        f1s.append(f1)
+    return float(np.mean(f1s)) if f1s else 0.0
+
+
+@torch.no_grad()
+def evaluate_classification(model: torch.nn.Module,
+                            dataloader,
+                            device: torch.device,
+                            num_batches: Optional[int] = None) -> Dict[str, float]:
+    """
+    Basic classification metrics: accuracy and macro-F1 on up to num_batches of dataloader.
+    """
     model.eval()
-    batch_times = []
-    memory_usage = []
-    total_samples = 0
-    total_time = 0.0
+    preds_all: List[int] = []
+    labels_all: List[int] = []
 
+    for i, batch in enumerate(dataloader):
+        logits, labels = _model_step(model, batch, device)
+        if labels is None:
+            # If labels are missing, we cannot compute accuracy/F1.
+            break
+        preds = _preds_from_logits(logits)
+        preds_all.extend(preds.detach().cpu().tolist())
+        labels_all.extend(labels.detach().cpu().tolist())
+
+        if num_batches is not None and (i + 1) >= num_batches:
+            break
+
+    if not preds_all or not labels_all:
+        return {"eval_accuracy": 0.0, "eval_f1": 0.0}
+
+    preds_np = np.asarray(preds_all, dtype=np.int64)
+    labels_np = np.asarray(labels_all, dtype=np.int64)
+    accuracy = float((preds_np == labels_np).mean())
+    cm = _compute_confusion(preds_np, labels_np)
+    f1 = _macro_f1(cm)
+
+    return {"eval_accuracy": accuracy, "eval_f1": f1}
+
+
+@torch.no_grad()
+def measure_inference_time(model: torch.nn.Module,
+                           dataloader,
+                           device: torch.device,
+                           num_batches: int = 50,
+                           warmup: int = 5) -> Dict[str, float]:
+    """
+    Measures average per-batch inference time (seconds) with a small warmup.
+    """
+    model.eval()
     # Warmup
-    with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            if i >= 3:
-                break
-            batch = {k: v.to(device) for k, v in batch.items()}
-            _ = model(batch["input_ids"], batch["attention_mask"])
+    it = iter(dataloader)
+    for _ in range(min(warmup, num_batches)):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        _model_step(model, batch, device)
 
-    # Measurement
-    with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            if i >= num_batches:
-                break
-
-            batch = {k: v.to(device) for k, v in batch.items()}
-            batch_size = batch["input_ids"].size(0)
-
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-                memory_before = torch.cuda.memory_allocated()
-
-            start = time.time()
-            _ = model(batch["input_ids"], batch["attention_mask"], return_attention_info=True)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            end = time.time()
-
-            elapsed = end - start
-            batch_times.append(elapsed)
-            total_time += elapsed
-            total_samples += batch_size
-
-            if device.type == "cuda":
-                memory_after = torch.cuda.memory_allocated()
-                memory_usage.append((memory_after - memory_before) / 1024**2)  # MB
-
-    avg_inference_time = np.mean(batch_times)
-    std_inference_time = np.std(batch_times)
-
-    metrics = {
-        "avg_inference_time_ms": avg_inference_time * 1000,
-        "std_inference_time_ms": std_inference_time * 1000,
-        "throughput_samples_per_sec": total_samples / total_time if total_time > 0 else 0.0,
-    }
-
-    if device.type == "cuda" and memory_usage:
-        metrics["avg_memory_usage_mb"] = float(np.mean(memory_usage))
-        metrics["peak_memory_usage_mb"] = float(torch.cuda.max_memory_reserved() / 1024**2)
-
-    return metrics
+    # Timed
+    start = time.perf_counter()
+    total_batches = 0
+    it = iter(dataloader)
+    for _ in range(num_batches):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        _model_step(model, batch, device)
+        total_batches += 1
+    elapsed = time.perf_counter() - start
+    avg_batch_time = elapsed / total_batches if total_batches else float("inf")
+    return {"avg_batch_inference_time_sec": float(avg_batch_time)}
 
 
-def analyze_attention_patterns(
-    model: nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    device: torch.device,
-    num_samples: int = 100,
-    save_path: str = None
-) -> Dict[str, Any]:
+@torch.no_grad()
+def measure_throughput(model: torch.nn.Module,
+                       dataloader,
+                       device: torch.device,
+                       num_batches: int = 50,
+                       warmup: int = 5) -> Dict[str, float]:
     """
-    Analyze attention patterns collected from adaptive attention layers.
+    Measures samples/sec over num_batches (after warmup).
     """
-
     model.eval()
-    all_pattern_weights = []
-    sequence_lengths = []
+    # Warmup
+    it = iter(dataloader)
+    for _ in range(min(warmup, num_batches)):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        _model_step(model, batch, device)
 
-    with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            if len(all_pattern_weights) >= num_samples:
+    # Timed throughput
+    start = time.perf_counter()
+    seen = 0
+    total_batches = 0
+    it = iter(dataloader)
+    for _ in range(num_batches):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        bsz = None
+        for v in batch.values():
+            if isinstance(v, torch.Tensor):
+                bsz = v.size(0)
                 break
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(batch["input_ids"], batch["attention_mask"], return_attention_info=True)
+        if bsz is None:
+            # fallback if batch is weird
+            bsz = 1
 
-            attention_info = outputs.get("attention_info", [])
-            for layer_info in attention_info:
-                if "pattern_weights" in layer_info:
-                    weights = layer_info["pattern_weights"].detach().cpu().numpy()
-                    # Flatten to (batch, 3)
-                    if weights.ndim == 3:  # (batch, heads, 3)
-                        weights = weights.mean(axis=1)
-                    all_pattern_weights.extend(weights)
+        _model_step(model, batch, device)
+        seen += int(bsz)
+        total_batches += 1
 
-                    seq_lens = batch["attention_mask"].sum(dim=1).cpu().numpy()
-                    sequence_lengths.extend(seq_lens)
-
-    if not all_pattern_weights:
-        return {"error": "No attention pattern data found"}
-
-    pattern_weights = np.array(all_pattern_weights)
-    sequence_lengths = np.array(sequence_lengths)
-
-    analysis = {
-        "avg_local_usage": float(np.mean(pattern_weights[:, 0])),
-        "avg_global_usage": float(np.mean(pattern_weights[:, 1])),
-        "avg_sparse_usage": float(np.mean(pattern_weights[:, 2])),
-        "pattern_variance": np.var(pattern_weights, axis=0).tolist(),
-        "pattern_correlations": np.corrcoef(pattern_weights.T).tolist(),
-        "sequence_length_stats": {
-            "mean": float(np.mean(sequence_lengths)),
-            "std": float(np.std(sequence_lengths)),
-            "min": int(np.min(sequence_lengths)),
-            "max": int(np.max(sequence_lengths)),
-        },
+    elapsed = time.perf_counter() - start
+    tps = seen / elapsed if elapsed > 0 else 0.0
+    return {
+        "throughput_samples_per_sec": float(tps),
+        "measured_batches": int(total_batches),
+        "measured_samples": int(seen),
+        "elapsed_sec": float(elapsed),
     }
 
-    # Stratify by sequence length if enough data
-    if len(sequence_lengths) > 50:
-        percentiles = np.percentile(sequence_lengths, [33, 67])
-        short_mask = sequence_lengths < percentiles[0]
-        medium_mask = (sequence_lengths >= percentiles[0]) & (sequence_lengths < percentiles[1])
-        long_mask = sequence_lengths >= percentiles[1]
 
-        analysis["pattern_by_length"] = {
-            "short_sequences": pattern_weights[short_mask].mean(axis=0).tolist() if short_mask.any() else [0, 0, 0],
-            "medium_sequences": pattern_weights[medium_mask].mean(axis=0).tolist() if medium_mask.any() else [0, 0, 0],
-            "long_sequences": pattern_weights[long_mask].mean(axis=0).tolist() if long_mask.any() else [0, 0, 0],
+@torch.no_grad()
+def analyze_attention_patterns(model: torch.nn.Module,
+                               dataloader,
+                               device: torch.device,
+                               num_batches: int = 10) -> Dict[str, Any]:
+    """
+    Best-effort attention diagnostics. If the model exposes attention weights or
+    a debug dict (e.g., model.last_attention_info), summarize them. Otherwise,
+    return an empty-but-valid report.
+    """
+    model.eval()
+    report: Dict[str, Any] = {
+        "available": False,
+        "num_batches": 0,
+        "summary": {},
+    }
+
+    # Heuristic: check typical attributes/hooks some adaptive models expose
+    # e.g., model.enable_attention_debug(), model.clear_attention_debug(), model.attention_debug
+    enable_debug = getattr(model, "enable_attention_debug", None)
+    clear_debug = getattr(model, "clear_attention_debug", None)
+    fetch_debug = lambda m: getattr(m, "attention_debug", None)
+
+    if callable(enable_debug):
+        enable_debug(True)
+    if callable(clear_debug):
+        clear_debug()
+
+    batches_seen = 0
+    for i, batch in enumerate(dataloader):
+        _model_step(model, batch, device)
+        batches_seen += 1
+        if (i + 1) >= num_batches:
+            break
+
+    dbg = fetch_debug(model)
+    if dbg is None:
+        # Try a second convention: model.last_attention_info
+        dbg = getattr(model, "last_attention_info", None)
+
+    if dbg is not None:
+        report["available"] = True
+        # Summarize a few common fields if present
+        summary: Dict[str, Any] = {}
+        if isinstance(dbg, dict):
+            # Example optional fields:
+            #   "pattern_weights": (B, P)
+            #   "mask_density": float or list
+            #   "avg_local_span": float
+            # Collect safe stats:
+            pw = dbg.get("pattern_weights", None)
+            if isinstance(pw, torch.Tensor):
+                pw = pw.detach().float().mean(dim=0).cpu().tolist()
+                summary["pattern_weights_mean"] = pw
+            md = dbg.get("mask_density", None)
+            if isinstance(md, (list, tuple)):
+                try:
+                    summary["mask_density_mean"] = float(np.mean(md))
+                except Exception:
+                    pass
+            elif isinstance(md, (int, float)):
+                summary["mask_density_mean"] = float(md)
+            als = dbg.get("avg_local_span", None)
+            if isinstance(als, (int, float)):
+                summary["avg_local_span"] = float(als)
+        report["summary"] = summary
+
+    report["num_batches"] = batches_seen
+    # Cleanup
+    if callable(enable_debug):
+        enable_debug(False)
+    return report
+
+
+@torch.no_grad()
+def benchmark_models(adaptive_model: torch.nn.Module,
+                     baseline_model: torch.nn.Module,
+                     dataloader,
+                     device: torch.device,
+                     num_batches: int = 50) -> Dict[str, Any]:
+    """
+    Benchmarks adaptive vs baseline: accuracy/F1, avg batch inference time, throughput.
+    Returns a dict with per-model metrics and an 'improvements' section (percent deltas).
+    Positive improvement means adaptive is better (higher), negative for time (lower is better).
+    """
+    # Accuracy / F1 (use same slice for fairness)
+    adaptive_cls = evaluate_classification(adaptive_model, dataloader, device, num_batches=num_batches)
+    baseline_cls = evaluate_classification(baseline_model, dataloader, device, num_batches=num_batches)
+
+    # Inference time
+    adaptive_time = measure_inference_time(adaptive_model, dataloader, device, num_batches=num_batches)
+    baseline_time = measure_inference_time(baseline_model, dataloader, device, num_batches=num_batches)
+
+    # Throughput
+    adaptive_tp = measure_throughput(adaptive_model, dataloader, device, num_batches=num_batches)
+    baseline_tp = measure_throughput(baseline_model, dataloader, device, num_batches=num_batches)
+
+    def pct_impr(adapt: float, base: float, higher_is_better: bool) -> float:
+        # percent change relative to baseline
+        if base == 0:
+            return 0.0
+        raw = (adapt - base) / base * 100.0
+        return float(raw if higher_is_better else -raw)  # invert sign for "lower is better"
+
+    improvements = {
+        "accuracy_improvement_percent": pct_impr(adaptive_cls["eval_accuracy"],  baseline_cls["eval_accuracy"],  True),
+        "f1_improvement_percent":       pct_impr(adaptive_cls["eval_f1"],        baseline_cls["eval_f1"],        True),
+        "inference_time_improvement_percent": pct_impr(adaptive_time["avg_batch_inference_time_sec"],
+                                                       baseline_time["avg_batch_inference_time_sec"], False),
+        "throughput_improvement_percent":     pct_impr(adaptive_tp["throughput_samples_per_sec"],
+                                                       baseline_tp["throughput_samples_per_sec"], True),
+    }
+
+    return {
+        "adaptive": {
+            **adaptive_cls,
+            **adaptive_time,
+            **adaptive_tp,
+        },
+        "baseline": {
+            **baseline_cls,
+            **baseline_time,
+            **baseline_tp,
+        },
+        "improvements": improvements,
+        "settings": {
+            "num_batches": int(num_batches),
         }
-
-    if save_path:
-        create_attention_visualizations(pattern_weights, sequence_lengths, save_path)
-
-    return analysis
-
-
-def create_attention_visualizations(
-    pattern_weights: np.ndarray,
-    sequence_lengths: np.ndarray,
-    save_path: str
-):
-    """Generate plots for attention pattern analysis."""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle("Adaptive Attention Pattern Analysis", fontsize=16, fontweight="bold")
-
-    # Histogram
-    ax1 = axes[0, 0]
-    ax1.hist(pattern_weights[:, 0], bins=30, alpha=0.6, label="Local", color="blue")
-    ax1.hist(pattern_weights[:, 1], bins=30, alpha=0.6, label="Global", color="red")
-    ax1.hist(pattern_weights[:, 2], bins=30, alpha=0.6, label="Sparse", color="green")
-    ax1.set_title("Distribution of Attention Pattern Weights")
-    ax1.legend()
-
-    # Scatter vs sequence length
-    ax2 = axes[0, 1]
-    alpha = min(0.6, 1000 / len(sequence_lengths))
-    ax2.scatter(sequence_lengths, pattern_weights[:, 0], alpha=alpha, label="Local", color="blue", s=10)
-    ax2.scatter(sequence_lengths, pattern_weights[:, 1], alpha=alpha, label="Global", color="red", s=10)
-    ax2.scatter(sequence_lengths, pattern_weights[:, 2], alpha=alpha, label="Sparse", color="green", s=10)
-    ax2.set_title("Pattern Usage vs Sequence Length")
-    ax2.legend()
-
-    # Correlation heatmap
-    ax3 = axes[1, 0]
-    corr = np.corrcoef(pattern_weights.T)
-    sns.heatmap(corr, annot=True, cmap="coolwarm", center=0,
-                xticklabels=["Local", "Global", "Sparse"],
-                yticklabels=["Local", "Global", "Sparse"], ax=ax3)
-    ax3.set_title("Pattern Correlations")
-
-    # Usage by bins
-    ax4 = axes[1, 1]
-    num_bins = 5
-    seq_bins = np.linspace(sequence_lengths.min(), sequence_lengths.max(), num_bins + 1)
-    bin_centers = (seq_bins[:-1] + seq_bins[1:]) / 2
-    local, global_, sparse = [], [], []
-
-    for i in range(num_bins):
-        mask = (sequence_lengths >= seq_bins[i]) & (sequence_lengths < seq_bins[i + 1])
-        if mask.any():
-            local.append(pattern_weights[mask, 0].mean())
-            global_.append(pattern_weights[mask, 1].mean())
-            sparse.append(pattern_weights[mask, 2].mean())
-        else:
-            local.append(0)
-            global_.append(0)
-            sparse.append(0)
-
-    x = np.arange(len(bin_centers))
-    width = 0.25
-    ax4.bar(x - width, local, width, label="Local", alpha=0.7)
-    ax4.bar(x, global_, width, label="Global", alpha=0.7)
-    ax4.bar(x + width, sparse, width, label="Sparse", alpha=0.7)
-    ax4.set_xticks(x)
-    ax4.set_xticklabels([f"{int(c)}" for c in bin_centers])
-    ax4.set_title("Pattern Usage by Sequence Length")
-    ax4.legend()
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    plt.close()
-    print(f"📊 Attention visualizations saved to {save_path}")
-
-
-def benchmark_models(
-    adaptive_model: nn.Module,
-    baseline_model: nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    device: torch.device,
-    num_batches: int = 20
-) -> Dict[str, Dict[str, float]]:
-    """Benchmark adaptive vs baseline models on speed, memory, and size."""
-
-    results = {}
-    for name, model in {"adaptive": adaptive_model, "baseline": baseline_model}.items():
-        metrics = compute_efficiency_metrics(model, dataloader, device, num_batches)
-        params = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-        results[name] = {
-            **metrics,
-            "total_parameters": params,
-            "trainable_parameters": trainable,
-            "model_size_mb": params * 4 / (1024**2),  # float32
-        }
-
-    # Relative improvements
-    if "adaptive" in results and "baseline" in results:
-        improvements = {}
-        base, adap = results["baseline"], results["adaptive"]
-
-        if base.get("avg_inference_time_ms", 0) > 0:
-            improvements["inference_time_improvement_percent"] = (
-                (base["avg_inference_time_ms"] - adap["avg_inference_time_ms"]) / base["avg_inference_time_ms"] * 100
-            )
-        if base.get("throughput_samples_per_sec", 0) > 0:
-            improvements["throughput_improvement_percent"] = (
-                (adap["throughput_samples_per_sec"] - base["throughput_samples_per_sec"]) / base["throughput_samples_per_sec"] * 100
-            )
-
-        results["improvements"] = improvements
-
-    return results
+    }
