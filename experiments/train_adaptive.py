@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Train Adaptive Sparse Transformer (clean, with dataloader fixes):
+Train Adaptive Sparse Transformer (clean, with dataloader + cache_dir fixes):
 - Removes truncated tokens and duplicate setup
 - Adds missing imports
 - Adds depth <-> num_layers compatibility shim
 - DEBUG overrides preserved
 - Does NOT pass max_seq_len to DatasetLoader.__init__
-- Optionally forwards max_seq_len to create_dataloaders if supported
+- Ensures a valid cache_dir even if YAML omits it (defaults to <repo>/data/.cache)
 """
 
 import sys
@@ -88,23 +88,27 @@ def main():
     data_cfg = config.get('data', {})
     subset_size = data_cfg.get('debug_subset_size', 2048) if args.debug else None
 
+    # Resolve a safe default cache dir if none specified in YAML
+    repo_root = Path(__file__).resolve().parents[1]
+    default_cache = repo_root / "data" / ".cache"
+    cache_dir = data_cfg.get('cache_dir') or str(default_cache)
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
     dataset_loader = DatasetLoader(
         dataset_name=data_cfg.get('dataset_name', 'ag_news'),
         tokenizer_name=data_cfg.get('tokenizer_name', 'bert-base-uncased'),
-        cache_dir=data_cfg.get('cache_dir', None)
+        cache_dir=cache_dir
     )
 
-    # If your DatasetLoader.create_dataloaders supports max_seq_len, keep the kw line; otherwise delete it.
+    # If your DatasetLoader.create_dataloaders supports max_seq_len, this kw is safe.
     create_dl_kwargs = dict(
         batch_size=config['training']['batch_size'],
         num_workers=data_cfg.get('num_workers', 4),
         train_subset_size=subset_size,
         eval_subset_size=(subset_size // 4) if subset_size else None,
-        pin_memory=config.get('hardware', {}).get('pin_memory', False)
+        pin_memory=config.get('hardware', {}).get('pin_memory', False),
+        max_seq_len=config['model'].get('max_seq_len')  # harmless if ignored by implementation
     )
-    # Optional pass-through:
-    if 'max_seq_len' in config.get('model', {}):
-        create_dl_kwargs['max_seq_len'] = config['model']['max_seq_len']
 
     dataloaders = dataset_loader.create_dataloaders(**create_dl_kwargs)
 
@@ -212,7 +216,7 @@ def main():
         if mtype == 'comparison':
             continue
         fm = summary.get('final_eval_metrics', {})
-        print(f"\n{mtype.upper()} MODEL:")
+        print(f"\n{mtype.UPPER()} MODEL:")
         print(f"  Final Accuracy: {fm.get('eval_accuracy', 0):.4f}")
         print(f"  Final F1:       {fm.get('eval_f1', 0):.4f}")
         print(f"  Training Time:  {summary.get('training_time', 0):.2f}s")
