@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Train Adaptive Sparse Transformer (clean, with dataloader + cache_dir fixes):
-- Removes truncated tokens and duplicate setup
-- Adds missing imports
-- Adds depth <-> num_layers compatibility shim
+- No ellipses / duplicate setup
+- depth <-> num_layers compatibility shim
 - DEBUG overrides preserved
-- Does NOT pass max_seq_len to DatasetLoader.__init__
+- Does NOT pass max_seq_len to DatasetLoader.__init__ or .create_dataloaders
 - Ensures a valid cache_dir even if YAML omits it (defaults to <repo>/data/.cache)
 """
 
@@ -83,7 +82,7 @@ def main():
     set_seed(config['training']['seed'])
     device = _resolve_device(config, logger)
 
-    # -------- data (NO max_seq_len in DatasetLoader.__init__) --------
+    # -------- data (NO max_seq_len in DatasetLoader.*) --------
     logger.info("Setting up data loaders...")
     data_cfg = config.get('data', {})
     subset_size = data_cfg.get('debug_subset_size', 2048) if args.debug else None
@@ -100,17 +99,14 @@ def main():
         cache_dir=cache_dir
     )
 
-    # If your DatasetLoader.create_dataloaders supports max_seq_len, this kw is safe.
-    create_dl_kwargs = dict(
+    # Build dataloaders (no max_seq_len kw)
+    dataloaders = dataset_loader.create_dataloaders(
         batch_size=config['training']['batch_size'],
         num_workers=data_cfg.get('num_workers', 4),
         train_subset_size=subset_size,
         eval_subset_size=(subset_size // 4) if subset_size else None,
-        pin_memory=config.get('hardware', {}).get('pin_memory', False),
-        max_seq_len=config['model'].get('max_seq_len')  # harmless if ignored by implementation
+        pin_memory=config.get('hardware', {}).get('pin_memory', False)
     )
-
-    dataloaders = dataset_loader.create_dataloaders(**create_dl_kwargs)
 
     # -------- debug overrides --------
     if args.debug:
@@ -216,7 +212,7 @@ def main():
         if mtype == 'comparison':
             continue
         fm = summary.get('final_eval_metrics', {})
-        print(f"\n{mtype.UPPER()} MODEL:")
+        print(f"\n{mtype.upper()} MODEL:")
         print(f"  Final Accuracy: {fm.get('eval_accuracy', 0):.4f}")
         print(f"  Final F1:       {fm.get('eval_f1', 0):.4f}")
         print(f"  Training Time:  {summary.get('training_time', 0):.2f}s")
