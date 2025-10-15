@@ -12,7 +12,7 @@ class ModelConfig:
     """Model architecture configuration"""
     # Basic model parameters
     dim: int = 512
-    num_layers: int = 6
+    depth: int = 6
     num_heads: int = 8
     dropout: float = 0.1
     max_seq_length: int = 2048
