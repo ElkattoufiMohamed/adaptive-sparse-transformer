@@ -4,7 +4,7 @@ model:
   depth: 4 #8
   num_heads: 12
   mlp_ratio: 4.0
-  max_seq_len: 512
+  max_seq_len: 256
   dropout: 0.1
   num_classes: 2
 
@@ -32,17 +32,15 @@ training:
   seed: 42
 
 data:
-  dataset_name: "imdb"
-  max_length: 256
-  train_split: "train"
-  eval_split: "test"
+  dataset_name: ["imdb", "ag_news", "yelp_polarity", "dbpedia_14", "sst2", "trec", "amazon_polarity", "emotion"]
+  tokenizer_name: bert-base-uncased
   num_workers: 4
+  debug_subset_size: 4096
 
 wandb:
   project: "adaptive-sparse-transformer"
   entity: "mohamedelkattoufi-fsm"
   tags: ["transformer", "attention", "sparse", "pattern-learning"]
-  name: "adaptive_pattern_fix_v2" # Track this specific fix
 
 evaluation:
   eval_steps: 500
