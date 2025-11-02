@@ -51,11 +51,59 @@ class TestAdaptiveSparseAttention:
             
             # Check attention info
             assert 'pattern_weights' in attention_info
-            assert attention_info['pattern_weights'].shape == (batch_size, 3)
-            
+            assert attention_info['pattern_weights'].shape == (
+                batch_size,
+                seq_len,
+                attention.num_heads,
+                3,
+            )
+
             # Check pattern weights sum to 1 (softmax output)
             pattern_sums = attention_info['pattern_weights'].sum(dim=-1)
             assert torch.allclose(pattern_sums, torch.ones_like(pattern_sums), atol=1e-6)
+
+    def test_density_budget_enforcement(self):
+        """Token-level selector should respect the configured density budget."""
+        torch.manual_seed(0)
+        attention = AdaptiveSparseAttention(
+            dim=64,
+            num_heads=4,
+            local_window_size=8,
+            target_density=0.2,
+            num_global_anchors=4,
+        )
+
+        batch_size, seq_len = 2, 24
+        x = torch.randn(batch_size, seq_len, 64)
+
+        attention.eval()
+        with torch.no_grad():
+            _, info = attention(x)
+
+        actual_density = info["actual_density"]
+        target_density = info["target_density"]
+        assert actual_density <= target_density + attention.density_tolerance + 0.05
+
+    def test_global_anchors_are_accessible(self):
+        """Every token should be able to reach the configured global anchors."""
+        attention = AdaptiveSparseAttention(
+            dim=32,
+            num_heads=2,
+            local_window_size=4,
+            num_global_anchors=2,
+        )
+
+        batch_size, seq_len = 1, 12
+        x = torch.randn(batch_size, seq_len, 32)
+
+        attention.eval()
+        with torch.no_grad():
+            _, info = attention(x)
+
+        attn_mask = info["attention_mask"]  # (B, H, L, L)
+        anchor_columns = [0, seq_len - 1]
+        connectivity = attn_mask[..., anchor_columns].all(dim=-1)
+        assert connectivity.all().item()
     
     def test_attention_masks(self):
         """Test that attention masks work correctly."""
