@@ -404,29 +404,14 @@ class AdaptiveSparseAttention(nn.Module):
         target_counts = torch.where(valid_counts == 0, torch.zeros_like(target_counts), target_counts)
 
         masked_scores = combined_scores.masked_fill(~available_mask, float('-inf'))
+        sorted_indices = torch.argsort(masked_scores, dim=-1, descending=True)
+        rank_indices = torch.arange(L, device=device).view(1, 1, 1, L)
+        topk_mask = rank_indices < target_counts.unsqueeze(-1)
 
-        k_max = int(target_counts.max().item()) if target_counts.numel() > 0 else 0
-
-        if k_max > 0:
-            # Only materialise the top-k entries that could ever be kept.
-            _, topk_indices = torch.topk(
-                masked_scores,
-                k_max,
-                dim=-1,
-                largest=True,
-                sorted=False,
-            )
-
-            topk_available = available_mask.gather(-1, topk_indices)
-
-            rank_indices = torch.arange(k_max, device=device).view(1, 1, 1, k_max)
-            within_budget = rank_indices < target_counts.unsqueeze(-1)
-            selected_mask = within_budget & topk_available
-
-            selection = torch.zeros_like(available_mask, dtype=torch.bool)
-            selection.scatter_(-1, topk_indices, selected_mask)
-        else:
-            selection = torch.zeros_like(available_mask, dtype=torch.bool)
+        available_at_indices = available_mask.gather(-1, sorted_indices)
+        selected_mask = topk_mask & available_at_indices
+        selection = torch.zeros_like(available_mask, dtype=torch.bool)
+        selection.scatter_(-1, sorted_indices, selected_mask)
         budget_mask = mandatory_mask | selection
 
         # Guarantee at least one connection per row
