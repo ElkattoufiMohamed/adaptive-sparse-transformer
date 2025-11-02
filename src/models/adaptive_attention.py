@@ -32,6 +32,11 @@ class AdaptiveSparseAttention(nn.Module):
         pattern_temperature: float = 1.0,  # Start higher, anneal down
         min_pattern_temperature: float = 0.3,  # Minimum temperature
         pattern_dropout: float = 0.1,  # Lower dropout for pattern selector
+        target_density: float = 0.3,
+        min_density: float = 0.1,
+        density_tolerance: float = 0.05,
+        num_global_anchors: int = 8,
+        head_pattern_refinement: bool = True,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -57,16 +62,22 @@ class AdaptiveSparseAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.dropout_layer = nn.Dropout(self.dropout_p)
 
-        # Enhanced pattern selector with moderate initialization
+        self.target_density = target_density
+        self.min_density = min_density
+        self.density_tolerance = density_tolerance
+        self.num_global_anchors = num_global_anchors
+        self.head_pattern_refinement = head_pattern_refinement
+
+        # Token-level pattern selector with optional head refinement
+        self.pattern_dropout = nn.Dropout(pattern_dropout)
         self.pattern_selector = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),  # Add normalization for stability
-            nn.GELU(),  # Smoother than ReLU
-            nn.Dropout(pattern_dropout),
+            nn.LayerNorm(dim),
             nn.Linear(dim, dim // 2),
             nn.GELU(),
-            nn.Linear(dim // 2, 3),  # Output logits
+            nn.Linear(dim // 2, 3),
         )
+        if self.head_pattern_refinement:
+            self.head_pattern_refiner = nn.Linear(dim, num_heads * 3)
 
         # Mild learnable pattern bias
         self.pattern_bias = nn.Parameter(torch.tensor([0.05, 0.0, -0.05]))
@@ -91,16 +102,15 @@ class AdaptiveSparseAttention(nn.Module):
     def _init_weights(self):
         """Moderate initialization to allow learning."""
         # Pattern selector - moderate initialization
-        for i, module in enumerate(self.pattern_selector):
+        for module in self.pattern_selector:
             if isinstance(module, nn.Linear):
-                # Use smaller gain for all layers
                 nn.init.xavier_uniform_(module.weight, gain=0.5)
                 if module.bias is not None:
-                    if i == len(self.pattern_selector) - 1:  # Final layer
-                        # Very mild initial bias
-                        nn.init.constant_(module.bias, 0.0)
-                    else:
-                        nn.init.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
+        if self.head_pattern_refinement:
+            nn.init.xavier_uniform_(self.head_pattern_refiner.weight, gain=0.5)
+            if self.head_pattern_refiner.bias is not None:
+                nn.init.zeros_(self.head_pattern_refiner.bias)
 
         # QKV and projection - standard initialization
         nn.init.xavier_uniform_(self.qkv.weight, gain=1.0 / math.sqrt(2))
@@ -127,9 +137,23 @@ class AdaptiveSparseAttention(nn.Module):
             mask[i, start:end] = 1.0
         return mask
 
-    def create_global_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Binary global mask (all ones)."""
-        return torch.ones((seq_len, seq_len), device=device, dtype=torch.float32)
+    def create_global_anchor_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Binary mask that exposes a small number of global anchor tokens."""
+        if self.num_global_anchors <= 0:
+            return torch.zeros((seq_len, seq_len), device=device, dtype=torch.float32)
+
+        mask = torch.zeros((seq_len, seq_len), device=device, dtype=torch.float32)
+        # Always include beginning and end tokens
+        anchors = [0, max(seq_len - 1, 0)]
+        if self.num_global_anchors > 2 and seq_len > 2:
+            step = max(1, seq_len // self.num_global_anchors)
+            anchors.extend(range(step, seq_len - 1, step))
+        anchors = torch.unique(torch.tensor(anchors, device=device)).long()
+        anchors = anchors.clamp(0, seq_len - 1)
+
+        mask[:, anchors] = 1.0  # Everyone can attend to anchors
+        mask[anchors, :] = 1.0  # Anchors can attend globally
+        return mask
 
     def create_learned_sparse_mask(
         self, attention_scores: torch.Tensor, sparsity_ratio: float = 0.3
@@ -163,42 +187,45 @@ class AdaptiveSparseAttention(nn.Module):
         return mask
 
     def compute_pattern_losses(
-        self, 
+        self,
         pattern_weights: torch.Tensor,
         pattern_logits: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """Compute various losses to encourage pattern learning."""
-        
+
+        flat_weights = pattern_weights.reshape(-1, pattern_weights.shape[-1])
+        flat_logits = pattern_logits.reshape(-1, pattern_logits.shape[-1])
+
         # 1. Entropy loss - encourage exploration
-        pattern_entropy = -(pattern_weights * torch.log(pattern_weights + 1e-8)).sum(dim=-1)
+        pattern_entropy = -(flat_weights * torch.log(flat_weights + 1e-8)).sum(dim=-1)
         avg_entropy = pattern_entropy.mean()
         max_entropy = math.log(3.0)
         # Scale based on training progress
         entropy_weight = max(0.5, 1.0 - self.step_count / 10000)
         diversity_loss = (max_entropy - avg_entropy) * entropy_weight
-        
+
         # 2. Batch variance loss - different samples should use different patterns
-        batch_variance = pattern_weights.var(dim=0).sum()
+        batch_variance = flat_weights.var(dim=0, unbiased=False).sum()
         variance_loss = -batch_variance * 2.0
-        
+
         # 3. Temporal consistency loss - patterns shouldn't oscillate wildly
         consistency_loss = torch.tensor(0.0, device=pattern_weights.device)
         if self.prev_pattern_weights is not None and self.training:
             # Only apply to same-sized sequences
-            if self.prev_pattern_weights.shape[0] == pattern_weights.shape[0]:
+            if self.prev_pattern_weights.shape == pattern_weights.shape:
                 consistency_loss = F.mse_loss(
-                    pattern_weights, 
+                    pattern_weights,
                     self.prev_pattern_weights.detach()
                 ) * 0.1
-        
+
         # 4. Pattern activation loss - ensure all patterns get used
-        pattern_usage = pattern_weights.mean(dim=0)  # Average usage per pattern
+        pattern_usage = flat_weights.mean(dim=0)  # Average usage per pattern
         self.pattern_momentum = self.momentum_beta * self.pattern_momentum + (1 - self.momentum_beta) * pattern_usage
         # Penalize if any pattern is underused (below 15%)
         underuse_penalty = torch.relu(0.15 - self.pattern_momentum).sum() * 5.0
-        
+
         # 5. Logit variance loss - pattern logits should be decisive
-        logit_variance = pattern_logits.var(dim=-1).mean()
+        logit_variance = flat_logits.var(dim=-1, unbiased=False).mean()
         decisiveness_loss = -logit_variance * 0.5
         
         return {
@@ -236,68 +263,67 @@ class AdaptiveSparseAttention(nn.Module):
         # Compute attention scores
         attention_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # Pattern selection with improved features
-        # Use both mean and max pooling for better representation
-        pooled_mean = torch.mean(x, dim=1)  # (B, D)
-        pooled_max, _ = torch.max(x, dim=1)  # (B, D)
-        pooled_features = (pooled_mean + pooled_max) / 2.0
-        
-        # Add noise during training for exploration
-        if self.training:
-            feature_noise = torch.randn_like(pooled_features) * 0.1
-            pooled_features = pooled_features + feature_noise
-        
-        # Compute pattern logits
-        pattern_logits = self.pattern_selector(pooled_features)  # (B, 3)
-        pattern_logits = pattern_logits + self.pattern_bias
-        
+        # Token-level pattern selection
+        token_features = self.pattern_dropout(x)
+        base_logits = self.pattern_selector(token_features)  # (B, L, 3)
+
+        if self.head_pattern_refinement:
+            head_logits = self.head_pattern_refiner(token_features)
+            head_logits = head_logits.view(B, L, self.num_heads, 3)
+            pattern_logits = base_logits.unsqueeze(2) + head_logits
+        else:
+            pattern_logits = base_logits.unsqueeze(2).expand(B, L, self.num_heads, 3)
+
+        pattern_logits = pattern_logits + self.pattern_bias.view(1, 1, 1, -1)
+
         # Apply temperature (annealed during training)
-        pattern_weights = F.softmax(pattern_logits / self.current_pattern_temp, dim=-1)
-        
+        scaled_logits = pattern_logits / self.current_pattern_temp
+        pattern_weights = F.softmax(scaled_logits, dim=-1)
+
         # Add exploration noise during training
         if self.training and torch.rand(1).item() < 0.1:  # 10% of the time
-            explore_noise = torch.randn_like(pattern_weights) * 0.1
-            pattern_weights = F.softmax(pattern_logits + explore_noise, dim=-1)
+            explore_noise = torch.randn_like(pattern_logits) * 0.05
+            pattern_weights = F.softmax(scaled_logits + explore_noise, dim=-1)
 
         # Compute pattern losses
         pattern_losses = self.compute_pattern_losses(pattern_weights, pattern_logits)
-        
+
         # Update previous weights buffer
         if self.training:
             self.prev_pattern_weights = pattern_weights.detach()
 
-        # Debug logging
-        if self.training and self.step_count % 100 == 0:
-            with torch.no_grad():
-                print(f"\n=== Step {self.step_count} ===")
-                print(f"Pattern weights mean: {pattern_weights.mean(dim=0).cpu().numpy()}")
-                print(f"Pattern weights std: {pattern_weights.std(dim=0).cpu().numpy()}")
-                print(f"Pattern logits: {pattern_logits[0].cpu().numpy()}")
-                print(f"Current temperature: {self.current_pattern_temp:.3f}")
-                print(f"Pattern momentum: {self.pattern_momentum.cpu().numpy()}")
-                print(f"Total pattern loss: {pattern_losses['total_pattern_loss'].item():.4f}")
-
         # Create attention masks
         local_mask = self.create_local_mask(L, device)
-        global_mask = self.create_global_mask(L, device)
+        global_mask = self.create_global_anchor_mask(L, device)
         sparse_mask = self.create_learned_sparse_mask(attention_scores)
 
-        # Expand pattern weights for broadcasting
-        pw_local = pattern_weights[:, 0].view(B, 1, 1, 1)
-        pw_global = pattern_weights[:, 1].view(B, 1, 1, 1)
-        pw_sparse = pattern_weights[:, 2].view(B, 1, 1, 1)
+        # Reorder for head-first operations
+        pattern_weights_heads = pattern_weights.permute(0, 2, 1, 3).contiguous()
 
-        # Combine masks
-        combined_mask = (
-            pw_local * local_mask.unsqueeze(0).unsqueeze(0) +
-            pw_global * global_mask.unsqueeze(0).unsqueeze(0) +
-            pw_sparse * sparse_mask
+        # Expand pattern weights for broadcasting (B, H, L, 3)
+        pw_local = pattern_weights_heads[..., 0]
+        pw_global = pattern_weights_heads[..., 1]
+        pw_sparse = pattern_weights_heads[..., 2]
+
+        local_component = pw_local.unsqueeze(-1) * local_mask.unsqueeze(0).unsqueeze(0)
+        global_component = pw_global.unsqueeze(-1) * global_mask.unsqueeze(0).unsqueeze(0)
+        sparse_component = pw_sparse.unsqueeze(-1) * sparse_mask
+
+        combined_mask_scores = local_component + global_component + sparse_component
+
+        local_bool = local_mask.bool()
+        global_bool = global_mask.bool()
+        sparse_bool = sparse_mask.bool()
+        allowed_union = sparse_bool | (local_bool | global_bool).unsqueeze(0).unsqueeze(0)
+
+        combined_mask_scores = combined_mask_scores.masked_fill(~allowed_union, float('-inf'))
+
+        attention_mask_binary, density_metrics = self.enforce_density_budget(
+            combined_mask_scores,
+            allowed_union,
+            global_bool,
         )
 
-        # Apply threshold
-        threshold = 0.1  # Slightly higher threshold for cleaner attention
-        attention_mask_binary = combined_mask > threshold
-        
         # Mask attention scores
         attention_scores = attention_scores.masked_fill(~attention_mask_binary, float('-inf'))
 
@@ -335,16 +361,95 @@ class AdaptiveSparseAttention(nn.Module):
         attention_info = {
             "pattern_weights": pattern_weights,
             "attention_weights": attention_weights,
-            "local_ratio": float(pattern_weights[:, 0].mean().item()),
-            "global_ratio": float(pattern_weights[:, 1].mean().item()),
-            "sparse_ratio": float(pattern_weights[:, 2].mean().item()),
+            "attention_mask": attention_mask_binary,
+            "local_ratio": float(pw_local.mean().item()),
+            "global_ratio": float(pw_global.mean().item()),
+            "sparse_ratio": float(pw_sparse.mean().item()),
             "pattern_entropy": pattern_losses['diversity_loss'].item() if isinstance(pattern_losses['diversity_loss'], torch.Tensor) else pattern_losses['diversity_loss'],
             "pattern_logits_std": pattern_logits.std().item(),
             "current_temperature": self.current_pattern_temp,
+            "actual_density": density_metrics["actual_density"],
+            "target_density": density_metrics["target_density"],
+            "density_error": density_metrics["density_error"],
+            "anchors_per_row": density_metrics["anchors_per_row"],
+            "head_variance": float(pw_local.var(dim=1, unbiased=False).mean().item()),
             **{k: v.item() if isinstance(v, torch.Tensor) else v for k, v in pattern_losses.items()}
         }
 
         return out, attention_info
+
+    def enforce_density_budget(
+        self,
+        combined_scores: torch.Tensor,
+        allowed_union: torch.Tensor,
+        global_bool: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Project the mixed mask onto the target FLOPs/density budget."""
+
+        B, H, L, _ = combined_scores.shape
+        device = combined_scores.device
+        allowed_union = allowed_union.bool()
+
+        anchor_mask = global_bool.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
+        diag = torch.eye(L, device=device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
+        mandatory_mask = anchor_mask | diag
+        available_mask = allowed_union & ~mandatory_mask
+
+        valid_counts = available_mask.sum(dim=-1)
+        min_keep = max(1, int(self.min_density * L))
+
+        target_counts = (valid_counts.float() * self.target_density).round().long()
+        target_counts = torch.clamp(target_counts, min=min_keep)
+        target_counts = torch.minimum(target_counts, valid_counts.clamp(min=1))
+        target_counts = torch.where(valid_counts == 0, torch.zeros_like(target_counts), target_counts)
+
+        masked_scores = combined_scores.masked_fill(~available_mask, float('-inf'))
+
+        k_max = int(target_counts.max().item()) if target_counts.numel() > 0 else 0
+
+        if k_max > 0:
+            # Only materialise the top-k entries that could ever be kept.
+            _, topk_indices = torch.topk(
+                masked_scores,
+                k_max,
+                dim=-1,
+                largest=True,
+                sorted=False,
+            )
+
+            topk_available = available_mask.gather(-1, topk_indices)
+
+            rank_indices = torch.arange(k_max, device=device).view(1, 1, 1, k_max)
+            within_budget = rank_indices < target_counts.unsqueeze(-1)
+            selected_mask = within_budget & topk_available
+
+            selection = torch.zeros_like(available_mask, dtype=torch.bool)
+            selection.scatter_(-1, topk_indices, selected_mask)
+        else:
+            selection = torch.zeros_like(available_mask, dtype=torch.bool)
+        budget_mask = mandatory_mask | selection
+
+        # Guarantee at least one connection per row
+        row_has_value = budget_mask.any(dim=-1, keepdim=True)
+        fallback_needed = ~row_has_value
+        if fallback_needed.any():
+            fallback_indices = torch.argmax(allowed_union.float(), dim=-1, keepdim=True)
+            fallback_mask = torch.zeros_like(budget_mask)
+            fallback_mask.scatter_(-1, fallback_indices, True)
+            budget_mask = torch.where(fallback_needed, fallback_mask, budget_mask)
+
+        actual_density = budget_mask.float().mean().item()
+        mandatory_per_row = mandatory_mask.sum(dim=-1).float()
+        target_density = float(((target_counts.float() + mandatory_per_row).mean().item()) / L)
+        density_error = actual_density - target_density
+        anchors_per_row = anchor_mask.float().sum(dim=-1).float().mean().item() / L
+
+        return budget_mask, {
+            "actual_density": actual_density,
+            "target_density": target_density,
+            "density_error": density_error,
+            "anchors_per_row": anchors_per_row,
+        }
 
 
 class MultiHeadAdaptiveAttention(nn.Module):
