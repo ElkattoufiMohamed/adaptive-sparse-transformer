@@ -6,7 +6,7 @@ A novel transformer architecture that dynamically adapts its attention patterns 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/adaptive-sparse-transformer.git
+git clone https://github.com/ElkattoufiMohamed/adaptive-sparse-transformer.git
 cd adaptive-sparse-transformer
 
 # Create virtual environment
